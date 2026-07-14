@@ -30,7 +30,7 @@ function saveOutbox(q) {
 }
 function enqueue(op) {
   const q = loadOutbox();
-  q.push({ ...op, queuedAt: Date.now() });
+  q.push({ ...op, queuedAt: Date.now(), opId: Date.now().toString(36) + Math.random().toString(36).slice(2, 8) });
   saveOutbox(q);
 }
 export function pendingCount() { return loadOutbox().length; }
@@ -130,8 +130,13 @@ export async function drainOutbox(onStatusChange) {
   if (typeof navigator !== "undefined" && !navigator.onLine) return;
   draining = true;
   try {
-    let q = loadOutbox();
-    while (q.length > 0) {
+    while (true) {
+      // Re-read fresh on every iteration — items can be enqueued by other
+      // calls while we're awaiting a network request below, and we must
+      // never overwrite localStorage with a stale in-memory snapshot that
+      // doesn't include them (that would silently drop those entries).
+      const q = loadOutbox();
+      if (q.length === 0) break;
       const op = q[0];
       const sbTable = SB_TABLE[op.table];
       try {
@@ -143,9 +148,13 @@ export async function drainOutbox(onStatusChange) {
           const { error } = await supabase.from(sbTable).delete().eq("id", op.id);
           if (error) throw error;
         }
-        q = q.slice(1);
-        saveOutbox(q);
-        onStatusChange?.({ pending: q.length, ok: true });
+        // Re-read again right before removing — more items may have been
+        // queued while the request above was in flight.
+        const latest = loadOutbox();
+        const idx = latest.findIndex(x => x.opId === op.opId);
+        const next = idx >= 0 ? [...latest.slice(0, idx), ...latest.slice(idx + 1)] : latest;
+        saveOutbox(next);
+        onStatusChange?.({ pending: next.length, ok: true });
       } catch (e) {
         // Network or server error — stop draining, retry later
         onStatusChange?.({ pending: q.length, ok: false, error: e.message });

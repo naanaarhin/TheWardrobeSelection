@@ -1866,10 +1866,15 @@ function Settings({ db, setDb, showToast, onLogout, session }) {
           <div style={{ display: "flex", gap: 10 }}>
             <Btn kind="ghost" onClick={() => setConfirmReset(false)} style={{ flex: 1 }}>Cancel</Btn>
             <Btn kind="danger" style={{ flex: 1 }} onClick={async () => {
-              logAudit({ actor: session?.name, role: session?.role, action: "reset", entity: "data", entityId: "all", summary: "Reset all data (products, sales, clients, staff)" });
               localStorage.removeItem(STORAGE_KEY); localStorage.removeItem("tws_cache_v1"); localStorage.removeItem("tws_outbox_v1");
               const fresh = seed(); setDb(fresh); setConfirmReset(false); showToast("Clearing cloud data…");
-              try { await clearCloud(); showToast("All data reset"); } catch { showToast("Local data reset — cloud clear failed, check connection", "err"); }
+              try {
+                await clearCloud();
+                logAudit({ actor: session?.name, role: session?.role, action: "reset", entity: "data", entityId: "all", summary: "Reset all data (products, sales, clients, staff)" });
+                showToast("All data reset");
+              } catch {
+                showToast("Local data reset — cloud clear failed, check connection", "err");
+              }
             }}>Yes, delete all</Btn>
           </div>
         )}
