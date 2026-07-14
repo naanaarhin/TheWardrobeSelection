@@ -54,17 +54,21 @@ const fromSettingsRow = (r) => ({ shopName: r.shop_name, location: r.location, p
 const toAuditRow = (a) => ({ id: a.id, shop_id: SHOP_ID, at: a.at, actor: a.actor, role: a.role, action: a.action, entity: a.entity, entity_id: a.entityId, summary: a.summary });
 const fromAuditRow = (r) => ({ id: r.id, at: r.at, actor: r.actor, role: r.role, action: r.action, entity: r.entity, entityId: r.entity_id, summary: r.summary });
 
+const toReturnRow = (rt) => ({ id: rt.id, shop_id: SHOP_ID, sale_id: rt.saleId, date: rt.date, items: rt.items, refund_total: rt.refundTotal, reason: rt.reason, processed_by: rt.processedBy });
+const fromReturnRow = (r) => ({ id: r.id, saleId: r.sale_id, date: r.date, items: r.items, refundTotal: r.refund_total, reason: r.reason, processedBy: r.processed_by });
+
 // ── Pull full state from cloud (used on load / manual refresh) ──────────────
 export async function pullAll() {
-  const [products, sales, customers, staff, settingsRes] = await Promise.all([
+  const [products, sales, customers, staff, settingsRes, returns] = await Promise.all([
     supabase.from("tws_products").select("*").eq("shop_id", SHOP_ID),
     supabase.from("tws_sales").select("*").eq("shop_id", SHOP_ID).order("date", { ascending: false }),
     supabase.from("tws_customers").select("*").eq("shop_id", SHOP_ID),
     supabase.from("tws_staff").select("*").eq("shop_id", SHOP_ID),
     supabase.from("tws_settings").select("*").eq("shop_id", SHOP_ID).maybeSingle(),
+    supabase.from("tws_returns").select("*").eq("shop_id", SHOP_ID).order("date", { ascending: false }),
   ]);
 
-  const errors = [products.error, sales.error, customers.error, staff.error, settingsRes.error].filter(Boolean);
+  const errors = [products.error, sales.error, customers.error, staff.error, settingsRes.error, returns.error].filter(Boolean);
   if (errors.length) throw errors[0];
 
   return {
@@ -73,6 +77,7 @@ export async function pullAll() {
     customers: (customers.data || []).map(fromCustomerRow),
     staff: (staff.data || []).map(fromStaffRow),
     settings: settingsRes.data ? fromSettingsRow(settingsRes.data) : { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true },
+    returns: (returns.data || []).map(fromReturnRow),
   };
 }
 
@@ -85,6 +90,7 @@ export function queueUpsert(table, appRow) {
     staff:     toStaffRow,
     settings:  toSettingsRow,
     audit:     toAuditRow,
+    returns:   toReturnRow,
   }[table](appRow);
   enqueue({ type: "upsert", table, row: mapped });
   drainOutbox();
@@ -96,7 +102,7 @@ export function queueDelete(table, id) {
 }
 
 // ── Table name mapping (app table -> supabase table) ─────────────────────────
-const SB_TABLE = { products: "tws_products", sales: "tws_sales", customers: "tws_customers", staff: "tws_staff", settings: "tws_settings", audit: "tws_audit" };
+const SB_TABLE = { products: "tws_products", sales: "tws_sales", customers: "tws_customers", staff: "tws_staff", settings: "tws_settings", audit: "tws_audit", returns: "tws_returns" };
 
 // ── Audit trail ───────────────────────────────────────────────────────────────
 // Fire-and-forget: queues an entry the same way as any other write, so it's
@@ -158,6 +164,7 @@ export async function clearCloud() {
     supabase.from("tws_sales").delete().eq("shop_id", SHOP_ID),
     supabase.from("tws_customers").delete().eq("shop_id", SHOP_ID),
     supabase.from("tws_staff").delete().eq("shop_id", SHOP_ID),
+    supabase.from("tws_returns").delete().eq("shop_id", SHOP_ID),
   ]);
 }
 

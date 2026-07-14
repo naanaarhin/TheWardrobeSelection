@@ -61,6 +61,7 @@ function seed() {
     ],
     expenses: [],
     staff: [],
+    returns: [],
     settings: { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true },
   };
 }
@@ -455,6 +456,7 @@ function SyncPill({ status, onRefresh }) {
 function Dashboard({ db, setTab }) {
   const { products, sales, customers, expenses } = db;
   const today = todayISO();
+  const [showRestock, setShowRestock] = useState(false);
 
   const stats = useMemo(() => {
     const todaySales = sales.filter(s => s.date?.slice(0,10) === today);
@@ -570,7 +572,10 @@ function Dashboard({ db, setTab }) {
       {/* Low stock alert */}
       {stats.lowStock.length + stats.outStock.length > 0 && (
         <div style={{ background: W.amberBg, border: `1px solid #f0d59c`, borderRadius: 14, padding: "14px 18px", marginBottom: 8 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: W.amber, marginBottom: 8 }}>⚠ Restock Alert</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: W.amber }}>⚠ Restock Alert</div>
+            <button onClick={() => setShowRestock(true)} style={{ background: "#fff", border: `1px solid #f0d59c`, borderRadius: 8, padding: "5px 11px", fontSize: 11.5, fontWeight: 700, color: W.amber, cursor: "pointer", fontFamily: "inherit" }}>Generate List →</button>
+          </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
             {[...stats.outStock, ...stats.lowStock].slice(0, 8).map(p => (
               <Pill key={p.id} bg="#fff" color={p.qty <= 0 ? W.red : W.amber}>{p.name} · {p.qty} left</Pill>
@@ -578,7 +583,60 @@ function Dashboard({ db, setTab }) {
           </div>
         </div>
       )}
+
+      {showRestock && <RestockListModal items={[...stats.outStock, ...stats.lowStock]} onClose={() => setShowRestock(false)} />}
     </div>
+  );
+}
+
+// ── RESTOCK LIST MODAL ────────────────────────────────────────────────────────
+function RestockListModal({ items, onClose }) {
+  const suggested = items.map(p => ({ ...p, reorderQty: Math.max(p.threshold * 2 - p.qty, p.threshold, 1) }));
+
+  const asText = () => {
+    const lines = [
+      "THE WARDROBE SELECTION — Restock List",
+      new Date().toLocaleDateString("en-GH", { dateStyle: "full" }),
+      "",
+      ...suggested.map(p => `• ${p.name}${p.size && p.size !== "—" ? ` (${p.size})` : ""} — have ${p.qty}, order ${p.reorderQty}`),
+    ];
+    return lines.join("\n");
+  };
+
+  const copyList = async () => {
+    try { await navigator.clipboard.writeText(asText()); } catch (_) {}
+  };
+
+  const exportCSV = () => {
+    const rows = [["Product", "Category", "Size", "Current Qty", "Threshold", "Suggested Reorder"], ...suggested.map(p => [p.name, p.category, p.size || "—", p.qty, p.threshold, p.reorderQty])];
+    const csv = rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+    a.download = `TWS-restock-list-${todayISO()}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+
+  return (
+    <Modal title="Restock List" subtitle={`${suggested.length} item${suggested.length !== 1 ? "s" : ""} need attention`} onClose={onClose} wide>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 380, overflowY: "auto", marginBottom: 16 }}>
+        {suggested.map(p => (
+          <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: W.ink }}>{p.name}</div>
+              <div style={{ fontSize: 11, color: W.muted }}>{p.category}{p.size && p.size !== "—" ? ` · ${p.size}` : ""} · have {p.qty}</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: p.qty <= 0 ? W.red : W.amber, fontFamily: "'Playfair Display', serif" }}>+{p.reorderQty}</div>
+              <div style={{ fontSize: 9.5, color: W.muted }}>suggested</div>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <Btn kind="ghost" onClick={copyList} style={{ flex: 1 }}>📋 Copy as Text</Btn>
+        <Btn kind="gold" onClick={exportCSV} style={{ flex: 1 }}>↓ Export CSV</Btn>
+      </div>
+    </Modal>
   );
 }
 
@@ -735,6 +793,42 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
   const [payMethod, setPayMethod] = useState("Cash");
   const [discount, setDiscount] = useState("");
   const [receipt, setReceipt] = useState(null);
+  const [parked, setParked] = useState(() => {
+    try { const r = localStorage.getItem("tws_parked_carts"); return r ? JSON.parse(r) : []; } catch (_) { return []; }
+  });
+  const [showParked, setShowParked] = useState(false);
+
+  const saveParked = (list) => {
+    setParked(list);
+    try { localStorage.setItem("tws_parked_carts", JSON.stringify(list)); } catch (_) {}
+  };
+
+  const parkCart = () => {
+    if (cart.length === 0) { showToast("Cart is empty — nothing to park", "err"); return; }
+    const entry = {
+      id: uid(), parkedAt: nowStamp(), parkedBy: session?.name || "Cynthia Naana Arhin",
+      cart, customerId, channel, payMethod, discount,
+      label: customers.find(c => c.id === customerId)?.name || (channel === "online" ? "Online order" : "Walk-in"),
+    };
+    saveParked([entry, ...parked]);
+    setCart([]); setCustomerId(""); setChannel("walkin"); setDiscount("");
+    showToast("Cart parked — resume it any time");
+  };
+
+  const resumeCart = (entry) => {
+    setCart(entry.cart);
+    setCustomerId(entry.customerId || "");
+    setChannel(entry.channel || "walkin");
+    setPayMethod(entry.payMethod || "Cash");
+    setDiscount(entry.discount || "");
+    saveParked(parked.filter(p => p.id !== entry.id));
+    setShowParked(false);
+    showToast("Cart resumed");
+  };
+
+  const deleteParked = (id) => {
+    saveParked(parked.filter(p => p.id !== id));
+  };
 
   const available = products.filter(p => p.qty > 0 && p.name.toLowerCase().includes(search.toLowerCase()));
 
@@ -819,7 +913,14 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
         </div>
       )}
 
-      <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search products to add…" style={{ ...inputStyle, marginBottom: 12 }} />
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search products to add…" style={{ ...inputStyle, flex: 1 }} />
+        {parked.length > 0 && (
+          <button onClick={() => setShowParked(true)} style={{ background: W.amberBg, border: `1px solid #f0d59c`, borderRadius: 9, padding: "0 14px", fontSize: 12.5, fontWeight: 700, color: W.amber, cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+            ⏸ {parked.length}
+          </button>
+        )}
+      </div>
 
       {/* Product picker */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 20 }}>
@@ -838,7 +939,10 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
       {/* Cart */}
       {cart.length > 0 && (
         <div style={{ background: "#fff", borderRadius: 16, border: `1px solid ${W.border}`, overflow: "hidden", marginBottom: 16 }}>
-          <div style={{ background: W.blush, padding: "10px 16px", fontSize: 12.5, fontWeight: 700, color: W.wine }}>Cart · {cart.length} item{cart.length !== 1 ? "s" : ""}</div>
+          <div style={{ background: W.blush, padding: "10px 16px", fontSize: 12.5, fontWeight: 700, color: W.wine, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>Cart · {cart.length} item{cart.length !== 1 ? "s" : ""}</span>
+            <button onClick={parkCart} style={{ background: "none", border: `1px solid ${W.wine}55`, borderRadius: 7, padding: "4px 10px", fontSize: 11, fontWeight: 700, color: W.wine, cursor: "pointer", fontFamily: "inherit" }}>⏸ Park</button>
+          </div>
           {cart.map(x => (
             <div key={x.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: `1px solid ${W.blush}` }}>
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -897,7 +1001,41 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
         </div>
       )}
 
-      {cart.length === 0 && <div style={{ textAlign: "center", color: W.muted, padding: "30px 0", fontSize: 14 }}>Tap products above to start a sale.</div>}
+      {cart.length === 0 && parked.length === 0 && <div style={{ textAlign: "center", color: W.muted, padding: "30px 0", fontSize: 14 }}>Tap products above to start a sale.</div>}
+      {cart.length === 0 && parked.length > 0 && (
+        <div style={{ textAlign: "center", color: W.muted, padding: "20px 0", fontSize: 13 }}>
+          Tap products above, or <button onClick={() => setShowParked(true)} style={{ background: "none", border: "none", color: W.wine, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", fontSize: 13, textDecoration: "underline" }}>resume a parked cart ({parked.length})</button>
+        </div>
+      )}
+
+      {showParked && (
+        <Modal title="Parked Carts" subtitle={`${parked.length} waiting to resume`} onClose={() => setShowParked(false)}>
+          {parked.length === 0 ? (
+            <div style={{ textAlign: "center", color: W.muted, fontSize: 13, padding: "16px 0" }}>No parked carts.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {parked.map(p => {
+                const parkedTotal = p.cart.reduce((a, x) => a + x.price * x.qty, 0);
+                const mins = Math.floor((Date.now() - new Date(p.parkedAt).getTime()) / 60000);
+                const ago = mins < 60 ? `${mins}m ago` : `${Math.floor(mins/60)}h ago`;
+                return (
+                  <div key={p.id} style={{ background: W.blush, borderRadius: 12, padding: "12px 14px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                      <div style={{ fontSize: 13.5, fontWeight: 700, color: W.ink }}>{p.label}</div>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif" }}>{GHS(parkedTotal)}</div>
+                    </div>
+                    <div style={{ fontSize: 11, color: W.muted, marginBottom: 10 }}>{p.cart.reduce((a,x)=>a+x.qty,0)} items · parked {ago} by {p.parkedBy?.split(" ")[0]}</div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Btn small kind="ghost" onClick={() => deleteParked(p.id)} style={{ flex: 1 }}>Delete</Btn>
+                      <Btn small onClick={() => resumeCart(p)} style={{ flex: 2 }}>Resume →</Btn>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }
@@ -949,53 +1087,190 @@ function Receipt({ sale, shop, onDone, onNew }) {
 
 // ── SALES HISTORY ────────────────────────────────────────────────────────────
 function SalesHistory({ db, setDb, showToast, session }) {
-  const { sales } = db;
+  const { sales, returns = [] } = db;
   const [view, setView] = useState(null);
+  const [showReturn, setShowReturn] = useState(false);
+
+  // How much of each item in a sale has already been returned
+  const returnedQtyFor = (saleId) => {
+    const map = {};
+    returns.filter(r => r.saleId === saleId).forEach(r => r.items.forEach(it => { map[it.id] = (map[it.id] || 0) + it.qty; }));
+    return map;
+  };
+
+  const saleReturns = view ? returns.filter(r => r.saleId === view.id) : [];
+  const totalRefunded = saleReturns.reduce((a, r) => a + r.refundTotal, 0);
 
   return (
     <div>
       <SectionTitle title="Sales" subtitle={`${sales.length} transaction${sales.length !== 1 ? "s" : ""} recorded`} />
       {sales.length === 0 && <div style={{ textAlign: "center", color: W.muted, padding: 40, fontSize: 14 }}>No sales yet. Completed sales appear here.</div>}
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {sales.map(s => (
-          <div key={s.id} onClick={() => setView(s)} style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", border: `1px solid ${W.border}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{ width: 44, height: 44, borderRadius: 11, background: W.blush, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>{s.channel === "online" ? "🌐" : "🧾"}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: W.ink, display: "flex", alignItems: "center", gap: 6 }}>
-                {s.customerName}
-                {s.channel === "online" && <Pill bg={W.blush} color={W.wine}>Online</Pill>}
+        {sales.map(s => {
+          const hasReturn = returns.some(r => r.saleId === s.id);
+          return (
+            <div key={s.id} onClick={() => setView(s)} style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", border: `1px solid ${W.border}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ width: 44, height: 44, borderRadius: 11, background: W.blush, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>{s.channel === "online" ? "🌐" : "🧾"}</div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: W.ink, display: "flex", alignItems: "center", gap: 6 }}>
+                  {s.customerName}
+                  {s.channel === "online" && <Pill bg={W.blush} color={W.wine}>Online</Pill>}
+                  {hasReturn && <Pill bg={W.redBg} color={W.red}>Return</Pill>}
+                </div>
+                <div style={{ fontSize: 11.5, color: W.muted }}>{s.items.reduce((a,i)=>a+i.qty,0)} items · {s.payMethod} · {new Date(s.date).toLocaleDateString("en-GH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}{s.soldBy ? ` · ${s.soldBy.split(" ")[0]}` : ""}</div>
               </div>
-              <div style={{ fontSize: 11.5, color: W.muted }}>{s.items.reduce((a,i)=>a+i.qty,0)} items · {s.payMethod} · {new Date(s.date).toLocaleDateString("en-GH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}{s.soldBy ? ` · ${s.soldBy.split(" ")[0]}` : ""}</div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif" }}>{GHS(s.total)}</div>
             </div>
-            <div style={{ fontSize: 15, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif" }}>{GHS(s.total)}</div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
-      {view && (
-        <Modal title="Sale Details" subtitle={`#${view.id.slice(-6).toUpperCase()} · ${view.customerName}`} onClose={() => setView(null)}>
-          <div style={{ fontSize: 12, color: W.muted, marginBottom: 14 }}>{new Date(view.date).toLocaleString("en-GH", { dateStyle: "full", timeStyle: "short" })}{view.soldBy ? ` · Sold by ${view.soldBy}` : ""}{view.channel === "online" ? " · Online order" : ""}</div>
-          {view.items.map((it, i) => (
-            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "8px 0", borderBottom: `1px solid ${W.blush}` }}>
-              <span>{it.qty} × {it.name}</span><span style={{ fontWeight: 600 }}>{GHS(it.price * it.qty)}</span>
+      {view && !showReturn && (() => {
+        const returnedMap = returnedQtyFor(view.id);
+        const anyReturnable = view.items.some(it => (returnedMap[it.id] || 0) < it.qty);
+        return (
+          <Modal title="Sale Details" subtitle={`#${view.id.slice(-6).toUpperCase()} · ${view.customerName}`} onClose={() => setView(null)}>
+            <div style={{ fontSize: 12, color: W.muted, marginBottom: 14 }}>{new Date(view.date).toLocaleString("en-GH", { dateStyle: "full", timeStyle: "short" })}{view.soldBy ? ` · Sold by ${view.soldBy}` : ""}{view.channel === "online" ? " · Online order" : ""}</div>
+            {view.items.map((it, i) => {
+              const returnedQty = returnedMap[it.id] || 0;
+              return (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "8px 0", borderBottom: `1px solid ${W.blush}` }}>
+                  <span>{it.qty} × {it.name}{returnedQty > 0 && <span style={{ color: W.red, fontSize: 11.5, marginLeft: 6 }}>({returnedQty} returned)</span>}</span>
+                  <span style={{ fontWeight: 600 }}>{GHS(it.price * it.qty)}</span>
+                </div>
+              );
+            })}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.muted, marginBottom: 4 }}><span>Subtotal</span><span>{GHS(view.subtotal)}</span></div>
+              {view.discount > 0 && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.red, marginBottom: 4 }}><span>Discount</span><span>− {GHS(view.discount)}</span></div>}
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.green, marginBottom: 4 }}><span>Profit</span><span>{GHS(view.profit)}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 18, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif", borderTop: `1px solid ${W.border}`, paddingTop: 8, marginTop: 4 }}><span>Total</span><span>{GHS(view.total)}</span></div>
+              {totalRefunded > 0 && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.red, marginTop: 6 }}><span>Refunded</span><span>− {GHS(totalRefunded)}</span></div>}
             </div>
-          ))}
-          <div style={{ marginTop: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.muted, marginBottom: 4 }}><span>Subtotal</span><span>{GHS(view.subtotal)}</span></div>
-            {view.discount > 0 && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.red, marginBottom: 4 }}><span>Discount</span><span>− {GHS(view.discount)}</span></div>}
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: W.green, marginBottom: 4 }}><span>Profit</span><span>{GHS(view.profit)}</span></div>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 18, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif", borderTop: `1px solid ${W.border}`, paddingTop: 8, marginTop: 4 }}><span>Total</span><span>{GHS(view.total)}</span></div>
-          </div>
-          <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-            <Btn kind="danger" small onClick={() => { setDb(prev => ({ ...prev, sales: prev.sales.filter(x => x.id !== view.id) })); queueDelete("sales", view.id); logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "sale", entityId: view.id, summary: `Deleted sale #${view.id.slice(-6).toUpperCase()} (${GHS(view.total)})` }); setView(null); showToast("Sale deleted"); }}>Delete</Btn>
-            <div style={{ flex: 1 }} />
-            <Btn onClick={() => setView(null)}>Close</Btn>
-          </div>
-        </Modal>
+            <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+              <Btn kind="danger" small onClick={() => { setDb(prev => ({ ...prev, sales: prev.sales.filter(x => x.id !== view.id) })); queueDelete("sales", view.id); logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "sale", entityId: view.id, summary: `Deleted sale #${view.id.slice(-6).toUpperCase()} (${GHS(view.total)})` }); setView(null); showToast("Sale deleted"); }}>Delete</Btn>
+              <div style={{ flex: 1 }} />
+              {anyReturnable && <Btn kind="subtle" small onClick={() => setShowReturn(true)}>↩ Process Return</Btn>}
+              <Btn onClick={() => setView(null)}>Close</Btn>
+            </div>
+          </Modal>
+        );
+      })()}
+
+      {view && showReturn && (
+        <ReturnModal
+          sale={view}
+          alreadyReturned={returnedQtyFor(view.id)}
+          onClose={() => setShowReturn(false)}
+          onDone={() => { setShowReturn(false); }}
+          db={db}
+          setDb={setDb}
+          showToast={showToast}
+          session={session}
+        />
       )}
     </div>
   );
 }
+
+// ── RETURN / REFUND MODAL ─────────────────────────────────────────────────────
+function ReturnModal({ sale, alreadyReturned, onClose, onDone, db, setDb, showToast, session }) {
+  const [qtys, setQtys] = useState(() => {
+    const q = {};
+    sale.items.forEach(it => { q[it.id] = 0; });
+    return q;
+  });
+  const [reason, setReason] = useState("");
+
+  const maxFor = (it) => it.qty - (alreadyReturned[it.id] || 0);
+  const setQty = (id, val, max) => setQtys(p => ({ ...p, [id]: Math.max(0, Math.min(max, val)) }));
+
+  const returnItems = sale.items.filter(it => qtys[it.id] > 0).map(it => ({ id: it.id, name: it.name, price: it.price, cost: it.cost, qty: qtys[it.id] }));
+  const refundTotal = returnItems.reduce((a, it) => a + it.price * it.qty, 0);
+  const profitImpact = returnItems.reduce((a, it) => a + (it.price - it.cost) * it.qty, 0);
+
+  const submit = () => {
+    if (returnItems.length === 0) { showToast("Select at least one item to return", "err"); return; }
+
+    const ret = {
+      id: uid(), saleId: sale.id, date: nowStamp(), items: returnItems,
+      refundTotal, reason: reason.trim(), processedBy: session?.name || "Cynthia Naana Arhin",
+    };
+
+    // Restock returned items
+    const updatedProducts = db.products.map(p => {
+      const ri = returnItems.find(x => x.id === p.id);
+      return ri ? { ...p, qty: p.qty + ri.qty } : p;
+    });
+
+    // Reduce customer's lifetime spend if this was tied to a client
+    const cust = sale.customerId ? db.customers.find(c => c.id === sale.customerId) : null;
+    const updatedCustomer = cust ? { ...cust, spent: Math.max(0, (cust.spent || 0) - refundTotal) } : null;
+
+    setDb(prev => ({
+      ...prev,
+      returns: [ret, ...(prev.returns || [])],
+      products: updatedProducts,
+      customers: updatedCustomer ? prev.customers.map(c => c.id === updatedCustomer.id ? updatedCustomer : c) : prev.customers,
+    }));
+
+    queueUpsert("returns", ret);
+    returnItems.forEach(ri => {
+      const p = updatedProducts.find(x => x.id === ri.id);
+      if (p) queueUpsert("products", p);
+    });
+    if (updatedCustomer) queueUpsert("customers", updatedCustomer);
+
+    logAudit({ actor: session?.name, role: session?.role, action: "return", entity: "sale", entityId: sale.id, summary: `Processed return on sale #${sale.id.slice(-6).toUpperCase()} · ${GHS(refundTotal)}${reason ? ` · "${reason}"` : ""}` });
+
+    showToast(`Return processed · ${GHS(refundTotal)} refunded`);
+    onDone();
+  };
+
+  return (
+    <Modal title="Process Return" subtitle={`Sale #${sale.id.slice(-6).toUpperCase()} · ${sale.customerName}`} onClose={onClose}>
+      <p style={{ fontSize: 12.5, color: W.muted, marginBottom: 14, lineHeight: 1.6 }}>Choose how many of each item are being returned. Returned items go back into stock automatically.</p>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+        {sale.items.map(it => {
+          const max = maxFor(it);
+          if (max <= 0) return (
+            <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10, opacity: 0.5 }}>
+              <div style={{ flex: 1, fontSize: 13, color: W.muted }}>{it.name} — fully returned</div>
+            </div>
+          );
+          return (
+            <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: W.ink }}>{it.name}</div>
+                <div style={{ fontSize: 11, color: W.muted }}>{GHS(it.price)} each · {max} returnable</div>
+              </div>
+              <button onClick={() => setQty(it.id, qtys[it.id] - 1, max)} style={qtyBtn}>−</button>
+              <span style={{ fontSize: 14, fontWeight: 700, minWidth: 20, textAlign: "center" }}>{qtys[it.id]}</span>
+              <button onClick={() => setQty(it.id, qtys[it.id] + 1, max)} style={qtyBtn}>+</button>
+            </div>
+          );
+        })}
+      </div>
+
+      <Field label="Reason (optional)"><input style={inputStyle} value={reason} onChange={e => setReason(e.target.value)} placeholder="e.g. Wrong size, changed mind…" /></Field>
+
+      {refundTotal > 0 && (
+        <div style={{ background: W.redBg, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, fontWeight: 800, color: W.red }}>
+            <span>Refund Total</span><span>{GHS(refundTotal)}</span>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <Btn kind="ghost" onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
+        <Btn kind="danger" onClick={submit} style={{ flex: 1 }}>Confirm Return</Btn>
+      </div>
+    </Modal>
+  );
+}
+
 
 // ── CUSTOMERS ────────────────────────────────────────────────────────────────
 function Customers({ db, setDb, showToast, session }) {
@@ -1063,20 +1338,25 @@ function Customers({ db, setDb, showToast, session }) {
 
 // ── REPORTS (the signature feature) ──────────────────────────────────────────
 function Reports({ db }) {
-  const { sales, products, expenses } = db;
+  const { sales, products, expenses, returns = [] } = db;
   const [period, setPeriod] = useState("daily");
   const [custom, setCustom] = useState({ from: todayISO(), to: todayISO() });
 
   const range = useMemo(() => periodRange(period, custom), [period, custom]);
   const periodSales = useMemo(() => sales.filter(s => inRange(s.date, range)), [sales, range]);
+  const periodReturns = useMemo(() => returns.filter(r => inRange(r.date, range)), [returns, range]);
 
   const report = useMemo(() => {
-    const revenue = periodSales.reduce((a, s) => a + s.total, 0);
-    const profit = periodSales.reduce((a, s) => a + (s.profit || 0), 0);
+    const grossRevenue = periodSales.reduce((a, s) => a + s.total, 0);
+    const grossProfit = periodSales.reduce((a, s) => a + (s.profit || 0), 0);
+    const refunds = periodReturns.reduce((a, r) => a + r.refundTotal, 0);
+    const returnProfitImpact = periodReturns.reduce((a, r) => a + r.items.reduce((x, it) => x + (it.price - it.cost) * it.qty, 0), 0);
+    const revenue = grossRevenue - refunds;
+    const profit = grossProfit - returnProfitImpact;
     const discount = periodSales.reduce((a, s) => a + (s.discount || 0), 0);
     const units = periodSales.reduce((a, s) => a + s.items.reduce((x, i) => x + i.qty, 0), 0);
     const orders = periodSales.length;
-    const avgOrder = orders ? revenue / orders : 0;
+    const avgOrder = orders ? grossRevenue / orders : 0;
     const cost = revenue - profit;
     const margin = revenue ? (profit / revenue) * 100 : 0;
 
@@ -1097,8 +1377,8 @@ function Reports({ db }) {
     }));
     const topProducts = Object.entries(prodMap).sort((a, b) => b[1].rev - a[1].rev).slice(0, 6);
 
-    return { revenue, profit, discount, units, orders, avgOrder, cost, margin, payMap, channelMap, topProducts };
-  }, [periodSales]);
+    return { revenue, profit, discount, units, orders, avgOrder, cost, margin, payMap, channelMap, topProducts, refunds, grossRevenue, returnCount: periodReturns.length };
+  }, [periodSales, periodReturns]);
 
   // Trend chart data based on period
   const trend = useMemo(() => {
@@ -1223,7 +1503,7 @@ function Reports({ db }) {
       {/* Hero revenue */}
       <div style={{ background: `linear-gradient(135deg, ${W.wine}, ${W.wineDk})`, borderRadius: 18, padding: "22px 24px", color: "#fff", marginBottom: 14, position: "relative", overflow: "hidden" }}>
         <div style={{ position: "absolute", right: -30, top: -30, width: 150, height: 150, borderRadius: "50%", background: "rgba(201,162,76,0.12)" }} />
-        <div style={{ fontSize: 12, color: W.rose, letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>Revenue this period</div>
+        <div style={{ fontSize: 12, color: W.rose, letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>{report.refunds > 0 ? "Net Revenue (after refunds)" : "Revenue this period"}</div>
         <div style={{ fontSize: 36, fontWeight: 800, fontFamily: "'Playfair Display', serif", lineHeight: 1 }}>{GHS(report.revenue)}</div>
         <div style={{ display: "flex", gap: 22, marginTop: 16 }}>
           <div><div style={{ fontSize: 17, fontWeight: 700 }}>{GHS(report.profit)}</div><div style={{ fontSize: 11, color: W.rose }}>Profit ({report.margin.toFixed(0)}%)</div></div>
@@ -1237,6 +1517,7 @@ function Reports({ db }) {
         <MetricBox label="Cost of Goods" value={GHS(report.cost)} accent={W.amber} />
         <MetricBox label="Avg Order" value={GHS(report.avgOrder)} accent={W.accent} />
         <MetricBox label="Discounts" value={GHS(report.discount)} accent={W.red} />
+        {report.refunds > 0 && <MetricBox label={`Refunds (${report.returnCount})`} value={GHS(report.refunds)} accent={W.red} />}
       </div>
 
       {/* Trend chart */}
@@ -1386,8 +1667,8 @@ function StaffManagement({ db, setDb, showToast, session }) {
 
 // ── SETTINGS ─────────────────────────────────────────────────────────────────
 // ── AUDIT TRAIL VIEWER (admin only) ──────────────────────────────────────────
-const AUDIT_ICON = { created: "✚", updated: "✎", deleted: "🗑", sale: "🧾", reset: "⚠", restore: "↑" };
-const AUDIT_COLOR = { created: W.green, updated: W.gold, deleted: W.red, sale: W.wine, reset: W.red, restore: W.amber };
+const AUDIT_ICON = { created: "✚", updated: "✎", deleted: "🗑", sale: "🧾", reset: "⚠", restore: "↑", return: "↩" };
+const AUDIT_COLOR = { created: W.green, updated: W.gold, deleted: W.red, sale: W.wine, reset: W.red, restore: W.amber, return: W.red };
 
 function AuditTrail() {
   const [entries, setEntries] = useState(null); // null = not loaded yet
