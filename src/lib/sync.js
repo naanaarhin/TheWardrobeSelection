@@ -39,8 +39,8 @@ export function pendingCount() { return loadOutbox().length; }
 const toProductRow = (p) => ({ id: p.id, shop_id: SHOP_ID, name: p.name, category: p.category, sku: p.sku, cost: p.cost, price: p.price, qty: p.qty, threshold: p.threshold, size: p.size, color: p.color, updated_at: new Date().toISOString() });
 const fromProductRow = (r) => ({ id: r.id, name: r.name, category: r.category, sku: r.sku, cost: r.cost, price: r.price, qty: r.qty, threshold: r.threshold, size: r.size, color: r.color });
 
-const toSaleRow = (s) => ({ id: s.id, shop_id: SHOP_ID, date: s.date, items: s.items, subtotal: s.subtotal, discount: s.discount, total: s.total, profit: s.profit, pay_method: s.payMethod, customer_id: s.customerId, customer_name: s.customerName, sold_by: s.soldBy });
-const fromSaleRow = (r) => ({ id: r.id, date: r.date, items: r.items, subtotal: r.subtotal, discount: r.discount, total: r.total, profit: r.profit, payMethod: r.pay_method, customerId: r.customer_id, customerName: r.customer_name, soldBy: r.sold_by });
+const toSaleRow = (s) => ({ id: s.id, shop_id: SHOP_ID, date: s.date, items: s.items, subtotal: s.subtotal, discount: s.discount, total: s.total, profit: s.profit, pay_method: s.payMethod, customer_id: s.customerId, customer_name: s.customerName, sold_by: s.soldBy, channel: s.channel || "walkin" });
+const fromSaleRow = (r) => ({ id: r.id, date: r.date, items: r.items, subtotal: r.subtotal, discount: r.discount, total: r.total, profit: r.profit, payMethod: r.pay_method, customerId: r.customer_id, customerName: r.customer_name, soldBy: r.sold_by, channel: r.channel || "walkin" });
 
 const toCustomerRow = (c) => ({ id: c.id, shop_id: SHOP_ID, name: c.name, phone: c.phone, note: c.note, spent: c.spent || 0, visits: c.visits || 0, updated_at: new Date().toISOString() });
 const fromCustomerRow = (r) => ({ id: r.id, name: r.name, phone: r.phone, note: r.note, spent: r.spent, visits: r.visits });
@@ -50,6 +50,9 @@ const fromStaffRow = (r) => ({ id: r.id, name: r.name, pin: r.pin });
 
 const toSettingsRow = (s) => ({ shop_id: SHOP_ID, shop_name: s.shopName, location: s.location, phone: s.phone, updated_at: new Date().toISOString() });
 const fromSettingsRow = (r) => ({ shopName: r.shop_name, location: r.location, phone: r.phone, lowStockAlerts: true });
+
+const toAuditRow = (a) => ({ id: a.id, shop_id: SHOP_ID, at: a.at, actor: a.actor, role: a.role, action: a.action, entity: a.entity, entity_id: a.entityId, summary: a.summary });
+const fromAuditRow = (r) => ({ id: r.id, at: r.at, actor: r.actor, role: r.role, action: r.action, entity: r.entity, entityId: r.entity_id, summary: r.summary });
 
 // ── Pull full state from cloud (used on load / manual refresh) ──────────────
 export async function pullAll() {
@@ -81,6 +84,7 @@ export function queueUpsert(table, appRow) {
     customers: toCustomerRow,
     staff:     toStaffRow,
     settings:  toSettingsRow,
+    audit:     toAuditRow,
   }[table](appRow);
   enqueue({ type: "upsert", table, row: mapped });
   drainOutbox();
@@ -92,7 +96,26 @@ export function queueDelete(table, id) {
 }
 
 // ── Table name mapping (app table -> supabase table) ─────────────────────────
-const SB_TABLE = { products: "tws_products", sales: "tws_sales", customers: "tws_customers", staff: "tws_staff", settings: "tws_settings" };
+const SB_TABLE = { products: "tws_products", sales: "tws_sales", customers: "tws_customers", staff: "tws_staff", settings: "tws_settings", audit: "tws_audit" };
+
+// ── Audit trail ───────────────────────────────────────────────────────────────
+// Fire-and-forget: queues an entry the same way as any other write, so it's
+// offline-safe too. Never throws — a logging failure should never block the
+// action it's describing.
+export function logAudit({ actor, role, action, entity, entityId, summary }) {
+  try {
+    const entry = { id: "a" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), at: new Date().toISOString(), actor, role, action, entity, entityId, summary };
+    queueUpsert("audit", entry);
+  } catch (_) { /* never block the calling action */ }
+}
+
+// Audit log is pulled separately (not part of pullAll) since it can grow
+// large and admin only needs it when viewing Settings → Audit Trail.
+export async function pullAuditLog(limit = 200) {
+  const { data, error } = await supabase.from("tws_audit").select("*").eq("shop_id", SHOP_ID).order("at", { ascending: false }).limit(limit);
+  if (error) throw error;
+  return (data || []).map(fromAuditRow);
+}
 
 // ── Drain queue to Supabase whenever possible ────────────────────────────────
 let draining = false;

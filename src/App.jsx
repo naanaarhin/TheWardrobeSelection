@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { loadCache, saveCache, pullAll, queueUpsert, queueDelete, drainOutbox, pendingCount, clearCloud } from "./lib/sync.js";
+import { loadCache, saveCache, pullAll, queueUpsert, queueDelete, drainOutbox, pendingCount, clearCloud, logAudit, pullAuditLog } from "./lib/sync.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE WARDROBE SELECTION — Premium Boutique Manager (single-user edition)
@@ -277,14 +277,15 @@ function BarChart({ data, height = 140, color = W.wine }) {
 
 // ── DONUT (category split) ───────────────────────────────────────────────────
 function Donut({ segments, size = 130 }) {
-  const total = segments.reduce((s, x) => s + x.value, 0) || 1;
+  const realTotal = segments.reduce((s, x) => s + x.value, 0);
+  const safeTotal = realTotal || 1; // only used for the SVG math, never for display
   let acc = 0;
   const r = size/2 - 12, cx = size/2, cy = size/2, circ = 2 * Math.PI * r;
   return (
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
       <circle cx={cx} cy={cy} r={r} fill="none" stroke={W.blushDk} strokeWidth={16} />
       {segments.map((s, i) => {
-        const frac = s.value / total;
+        const frac = s.value / safeTotal;
         const dash = frac * circ;
         const el = (
           <circle key={i} cx={cx} cy={cy} r={r} fill="none" stroke={s.color} strokeWidth={16}
@@ -294,7 +295,7 @@ function Donut({ segments, size = 130 }) {
         acc += frac;
         return el;
       })}
-      <text x={cx} y={cy - 4} textAnchor="middle" fontSize={20} fontWeight={800} fill={W.wine} fontFamily="'Playfair Display', serif">{total}</text>
+      <text x={cx} y={cy - 4} textAnchor="middle" fontSize={20} fontWeight={800} fill={W.wine} fontFamily="'Playfair Display', serif">{realTotal}</text>
       <text x={cx} y={cy + 14} textAnchor="middle" fontSize={10} fill={W.muted}>items</text>
     </svg>
   );
@@ -400,12 +401,12 @@ export default function App() {
       {/* Desktop side padding wrapper */}
       <main style={{ maxWidth: 960, margin: "0 auto", padding: "18px 16px" }}>
         {tab === "dashboard" && isAdmin && <Dashboard db={db} setTab={setTab} />}
-        {tab === "inventory" && isAdmin && <Inventory db={db} setDb={setDb} showToast={showToast} />}
+        {tab === "inventory" && isAdmin && <Inventory db={db} setDb={setDb} showToast={showToast} session={session} />}
         {tab === "sell"      && <NewSale db={db} setDb={setDb} showToast={showToast} setTab={setTab} session={session} isAdmin={isAdmin} />}
-        {tab === "sales"     && isAdmin && <SalesHistory db={db} setDb={setDb} showToast={showToast} />}
-        {tab === "customers" && isAdmin && <Customers db={db} setDb={setDb} showToast={showToast} />}
+        {tab === "sales"     && isAdmin && <SalesHistory db={db} setDb={setDb} showToast={showToast} session={session} />}
+        {tab === "customers" && isAdmin && <Customers db={db} setDb={setDb} showToast={showToast} session={session} />}
         {tab === "reports"   && isAdmin && <Reports db={db} />}
-        {tab === "settings"  && isAdmin && <Settings db={db} setDb={setDb} showToast={showToast} onLogout={logout} />}
+        {tab === "settings"  && isAdmin && <Settings db={db} setDb={setDb} showToast={showToast} onLogout={logout} session={session} />}
       </main>
 
       {/* Bottom nav */}
@@ -594,7 +595,7 @@ function SectionTitle({ title, subtitle, action }) {
 }
 
 // ── INVENTORY ────────────────────────────────────────────────────────────────
-function Inventory({ db, setDb, showToast }) {
+function Inventory({ db, setDb, showToast, session }) {
   const { products } = db;
   const [search, setSearch] = useState("");
   const [cat, setCat] = useState("All");
@@ -624,13 +625,16 @@ function Inventory({ db, setDb, showToast }) {
     };
     setDb(prev => ({ ...prev, products: editing ? prev.products.map(p => p.id === editing ? item : p) : [item, ...prev.products] }));
     queueUpsert("products", item);
+    logAudit({ actor: session?.name, role: session?.role, action: editing ? "updated" : "created", entity: "product", entityId: item.id, summary: `${editing ? "Updated" : "Added"} product "${item.name}" (qty ${item.qty}, ${GHS(item.price)})` });
     setShowModal(false);
     showToast(editing ? "Product updated" : "Product added");
   };
 
   const remove = (id) => {
+    const p = products.find(x => x.id === id);
     setDb(prev => ({ ...prev, products: prev.products.filter(p => p.id !== id) }));
     queueDelete("products", id);
+    logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "product", entityId: id, summary: `Deleted product "${p?.name || id}"` });
     setShowModal(false);
     showToast("Product removed");
   };
@@ -727,6 +731,7 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
   const [cart, setCart] = useState([]);
   const [search, setSearch] = useState("");
   const [customerId, setCustomerId] = useState("");
+  const [channel, setChannel] = useState("walkin"); // walkin | online
   const [payMethod, setPayMethod] = useState("Cash");
   const [discount, setDiscount] = useState("");
   const [receipt, setReceipt] = useState(null);
@@ -764,8 +769,8 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
     const cust = customers.find(c => c.id === customerId);
     const sale = {
       id: uid(), date: nowStamp(), items: cart.map(({ id, name, price, cost, qty }) => ({ id, name, price, cost, qty })),
-      subtotal, discount: disc, total, profit, payMethod,
-      customerId: customerId || null, customerName: cust?.name || "Walk-in",
+      subtotal, discount: disc, total, profit, payMethod, channel,
+      customerId: customerId || null, customerName: cust?.name || (channel === "online" ? "Online customer" : "Walk-in"),
       soldBy: session?.name || "Cynthia Naana Arhin",
     };
     const updatedProducts = products.map(p => {
@@ -789,8 +794,10 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
     });
     if (updatedCustomer) queueUpsert("customers", updatedCustomer);
 
+    logAudit({ actor: session?.name || "Cynthia Naana Arhin", role: session?.role || "admin", action: "sale", entity: "sale", entityId: sale.id, summary: `${channel === "online" ? "Online" : "Walk-in"} sale to ${sale.customerName} · ${GHS(total)} · ${payMethod}` });
+
     setReceipt(sale);
-    setCart([]); setDiscount(""); setCustomerId("");
+    setCart([]); setDiscount(""); setCustomerId(""); setChannel("walkin");
   };
 
   if (receipt) return <Receipt sale={receipt} shop={db.settings} onDone={() => { setReceipt(null); setTab(isAdmin ? "dashboard" : "sell"); }} onNew={() => setReceipt(null)} />;
@@ -848,10 +855,26 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
           ))}
 
           <div style={{ padding: 16 }}>
+            <Field label="Sale Channel">
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setChannel("walkin")} style={{
+                  flex: 1, padding: "10px 0", borderRadius: 9, cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 700,
+                  border: channel === "walkin" ? "none" : `1.5px solid ${W.border}`,
+                  background: channel === "walkin" ? `linear-gradient(135deg, ${W.wine}, ${W.wineDk})` : "#fff",
+                  color: channel === "walkin" ? "#fff" : W.muted,
+                }}>🏬 Walk-in</button>
+                <button onClick={() => setChannel("online")} style={{
+                  flex: 1, padding: "10px 0", borderRadius: 9, cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 700,
+                  border: channel === "online" ? "none" : `1.5px solid ${W.border}`,
+                  background: channel === "online" ? `linear-gradient(135deg, ${W.wine}, ${W.wineDk})` : "#fff",
+                  color: channel === "online" ? "#fff" : W.muted,
+                }}>🌐 Online</button>
+              </div>
+            </Field>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
               <Field label="Client">
                 <select style={inputStyle} value={customerId} onChange={e => setCustomerId(e.target.value)}>
-                  <option value="">Walk-in customer</option>
+                  <option value="">{channel === "online" ? "Online customer" : "Walk-in customer"}</option>
                   {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
               </Field>
@@ -925,7 +948,7 @@ function Receipt({ sale, shop, onDone, onNew }) {
 }
 
 // ── SALES HISTORY ────────────────────────────────────────────────────────────
-function SalesHistory({ db, setDb, showToast }) {
+function SalesHistory({ db, setDb, showToast, session }) {
   const { sales } = db;
   const [view, setView] = useState(null);
 
@@ -936,9 +959,12 @@ function SalesHistory({ db, setDb, showToast }) {
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {sales.map(s => (
           <div key={s.id} onClick={() => setView(s)} style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", border: `1px solid ${W.border}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{ width: 44, height: 44, borderRadius: 11, background: W.blush, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>🧾</div>
+            <div style={{ width: 44, height: 44, borderRadius: 11, background: W.blush, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>{s.channel === "online" ? "🌐" : "🧾"}</div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: W.ink }}>{s.customerName}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: W.ink, display: "flex", alignItems: "center", gap: 6 }}>
+                {s.customerName}
+                {s.channel === "online" && <Pill bg={W.blush} color={W.wine}>Online</Pill>}
+              </div>
               <div style={{ fontSize: 11.5, color: W.muted }}>{s.items.reduce((a,i)=>a+i.qty,0)} items · {s.payMethod} · {new Date(s.date).toLocaleDateString("en-GH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}{s.soldBy ? ` · ${s.soldBy.split(" ")[0]}` : ""}</div>
             </div>
             <div style={{ fontSize: 15, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif" }}>{GHS(s.total)}</div>
@@ -948,7 +974,7 @@ function SalesHistory({ db, setDb, showToast }) {
 
       {view && (
         <Modal title="Sale Details" subtitle={`#${view.id.slice(-6).toUpperCase()} · ${view.customerName}`} onClose={() => setView(null)}>
-          <div style={{ fontSize: 12, color: W.muted, marginBottom: 14 }}>{new Date(view.date).toLocaleString("en-GH", { dateStyle: "full", timeStyle: "short" })}{view.soldBy ? ` · Sold by ${view.soldBy}` : ""}</div>
+          <div style={{ fontSize: 12, color: W.muted, marginBottom: 14 }}>{new Date(view.date).toLocaleString("en-GH", { dateStyle: "full", timeStyle: "short" })}{view.soldBy ? ` · Sold by ${view.soldBy}` : ""}{view.channel === "online" ? " · Online order" : ""}</div>
           {view.items.map((it, i) => (
             <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "8px 0", borderBottom: `1px solid ${W.blush}` }}>
               <span>{it.qty} × {it.name}</span><span style={{ fontWeight: 600 }}>{GHS(it.price * it.qty)}</span>
@@ -961,7 +987,7 @@ function SalesHistory({ db, setDb, showToast }) {
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 18, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif", borderTop: `1px solid ${W.border}`, paddingTop: 8, marginTop: 4 }}><span>Total</span><span>{GHS(view.total)}</span></div>
           </div>
           <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-            <Btn kind="danger" small onClick={() => { setDb(prev => ({ ...prev, sales: prev.sales.filter(x => x.id !== view.id) })); queueDelete("sales", view.id); setView(null); showToast("Sale deleted"); }}>Delete</Btn>
+            <Btn kind="danger" small onClick={() => { setDb(prev => ({ ...prev, sales: prev.sales.filter(x => x.id !== view.id) })); queueDelete("sales", view.id); logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "sale", entityId: view.id, summary: `Deleted sale #${view.id.slice(-6).toUpperCase()} (${GHS(view.total)})` }); setView(null); showToast("Sale deleted"); }}>Delete</Btn>
             <div style={{ flex: 1 }} />
             <Btn onClick={() => setView(null)}>Close</Btn>
           </div>
@@ -972,7 +998,7 @@ function SalesHistory({ db, setDb, showToast }) {
 }
 
 // ── CUSTOMERS ────────────────────────────────────────────────────────────────
-function Customers({ db, setDb, showToast }) {
+function Customers({ db, setDb, showToast, session }) {
   const { customers } = db;
   const [showModal, setShowModal] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -987,6 +1013,7 @@ function Customers({ db, setDb, showToast }) {
     const c = { ...form, id: editing || uid(), spent: form.spent || 0, visits: form.visits || 0 };
     setDb(prev => ({ ...prev, customers: editing ? prev.customers.map(x => x.id === editing ? c : x) : [c, ...prev.customers] }));
     queueUpsert("customers", c);
+    logAudit({ actor: session?.name, role: session?.role, action: editing ? "updated" : "created", entity: "customer", entityId: c.id, summary: `${editing ? "Updated" : "Added"} client "${c.name}"` });
     setShowModal(false); showToast(editing ? "Client updated" : "Client added");
   };
 
@@ -1023,7 +1050,7 @@ function Customers({ db, setDb, showToast }) {
             </div>
           )}
           <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
-            {editing && <Btn kind="danger" small onClick={() => { setDb(prev => ({ ...prev, customers: prev.customers.filter(x => x.id !== editing) })); queueDelete("customers", editing); setShowModal(false); showToast("Client removed"); }}>Delete</Btn>}
+            {editing && <Btn kind="danger" small onClick={() => { setDb(prev => ({ ...prev, customers: prev.customers.filter(x => x.id !== editing) })); queueDelete("customers", editing); logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "customer", entityId: editing, summary: `Deleted client "${form.name}"` }); setShowModal(false); showToast("Client removed"); }}>Delete</Btn>}
             <div style={{ flex: 1 }} />
             <Btn kind="ghost" onClick={() => setShowModal(false)}>Cancel</Btn>
             <Btn onClick={save}>{editing ? "Save" : "Add"}</Btn>
@@ -1057,6 +1084,10 @@ function Reports({ db }) {
     const payMap = {};
     periodSales.forEach(s => { payMap[s.payMethod] = (payMap[s.payMethod] || 0) + s.total; });
 
+    // Channel breakdown (walk-in vs online)
+    const channelMap = { walkin: 0, online: 0 };
+    periodSales.forEach(s => { channelMap[s.channel || "walkin"] = (channelMap[s.channel || "walkin"] || 0) + s.total; });
+
     // Top products
     const prodMap = {};
     periodSales.forEach(s => s.items.forEach(it => {
@@ -1066,7 +1097,7 @@ function Reports({ db }) {
     }));
     const topProducts = Object.entries(prodMap).sort((a, b) => b[1].rev - a[1].rev).slice(0, 6);
 
-    return { revenue, profit, discount, units, orders, avgOrder, cost, margin, payMap, topProducts };
+    return { revenue, profit, discount, units, orders, avgOrder, cost, margin, payMap, channelMap, topProducts };
   }, [periodSales]);
 
   // Trend chart data based on period
@@ -1233,7 +1264,7 @@ function Reports({ db }) {
 
       {/* Payment breakdown */}
       {Object.keys(report.payMap).length > 0 && (
-        <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}` }}>
+        <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}`, marginBottom: 16 }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, marginBottom: 14 }}>Payment Methods</div>
           {Object.entries(report.payMap).map(([method, amt], i) => {
             const pct = report.revenue ? (amt / report.revenue) * 100 : 0;
@@ -1251,12 +1282,34 @@ function Reports({ db }) {
           })}
         </div>
       )}
+
+      {/* Channel breakdown: Walk-in vs Online */}
+      {report.revenue > 0 && (
+        <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}` }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, marginBottom: 14 }}>Walk-in vs Online</div>
+          {[["walkin", "🏬 Walk-in", W.wine], ["online", "🌐 Online", W.gold]].map(([key, label, color]) => {
+            const amt = report.channelMap[key] || 0;
+            const pct = report.revenue ? (amt / report.revenue) * 100 : 0;
+            return (
+              <div key={key} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 5 }}>
+                  <span style={{ color: W.ink, fontWeight: 600 }}>{label}</span>
+                  <span style={{ color, fontWeight: 700 }}>{GHS(amt)} · {pct.toFixed(0)}%</span>
+                </div>
+                <div style={{ height: 7, background: W.blush, borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 4 }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
 
 // ── STAFF MANAGEMENT (admin only) ────────────────────────────────────────────
-function StaffManagement({ db, setDb, showToast }) {
+function StaffManagement({ db, setDb, showToast, session }) {
   const staff = db.staff || [];
   const [showModal, setShowModal] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -1274,13 +1327,16 @@ function StaffManagement({ db, setDb, showToast }) {
     const person = { id: editing || uid(), name: form.name.trim(), pin: form.pin };
     setDb(prev => ({ ...prev, staff: editing ? (prev.staff||[]).map(s => s.id === editing ? person : s) : [...(prev.staff||[]), person] }));
     queueUpsert("staff", person);
+    logAudit({ actor: session?.name, role: session?.role, action: editing ? "updated" : "created", entity: "staff", entityId: person.id, summary: `${editing ? "Updated" : "Added"} salesperson "${person.name}"` });
     setShowModal(false);
     showToast(editing ? "Staff updated" : "Salesperson added");
   };
 
   const remove = (id) => {
+    const s = staff.find(x => x.id === id);
     setDb(prev => ({ ...prev, staff: (prev.staff||[]).filter(s => s.id !== id) }));
     queueDelete("staff", id);
+    logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "staff", entityId: id, summary: `Removed salesperson "${s?.name || id}"` });
     setShowModal(false);
     showToast("Staff removed");
   };
@@ -1329,7 +1385,103 @@ function StaffManagement({ db, setDb, showToast }) {
 }
 
 // ── SETTINGS ─────────────────────────────────────────────────────────────────
-function Settings({ db, setDb, showToast, onLogout }) {
+// ── AUDIT TRAIL VIEWER (admin only) ──────────────────────────────────────────
+const AUDIT_ICON = { created: "✚", updated: "✎", deleted: "🗑", sale: "🧾", reset: "⚠", restore: "↑" };
+const AUDIT_COLOR = { created: W.green, updated: W.gold, deleted: W.red, sale: W.wine, reset: W.red, restore: W.amber };
+
+function AuditTrail() {
+  const [entries, setEntries] = useState(null); // null = not loaded yet
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [open, setOpen] = useState(false);
+
+  const load = async () => {
+    setLoading(true); setError("");
+    try {
+      const rows = await pullAuditLog(200);
+      setEntries(rows);
+    } catch (e) {
+      setError("Could not load audit trail — check your connection.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && entries === null) load();
+  };
+
+  const entities = ["all", "product", "sale", "customer", "staff", "settings", "data"];
+  const filtered = (entries || []).filter(e => filter === "all" || e.entity === filter);
+
+  const timeAgo = (iso) => {
+    const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return "just now";
+    if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+    if (s < 604800) return `${Math.floor(s/86400)}d ago`;
+    return new Date(iso).toLocaleDateString("en-GH", { day: "numeric", month: "short" });
+  };
+
+  return (
+    <div style={{ background: "#fff", borderRadius: 16, border: `1px solid ${W.border}`, marginBottom: 16, overflow: "hidden" }}>
+      <button onClick={toggle} style={{ width: "100%", padding: 20, background: "none", border: "none", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", fontFamily: "inherit", textAlign: "left" }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: W.wine }}>Audit Trail</div>
+          <div style={{ fontSize: 12, color: W.muted, marginTop: 3 }}>Every change, who made it, and when</div>
+        </div>
+        <span style={{ fontSize: 18, color: W.muted, transform: open ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}>⌄</span>
+      </button>
+
+      {open && (
+        <div style={{ padding: "0 20px 20px" }}>
+          {loading && <div style={{ textAlign: "center", color: W.muted, fontSize: 13, padding: "16px 0" }}>Loading…</div>}
+          {error && (
+            <div style={{ textAlign: "center", padding: "12px 0" }}>
+              <div style={{ color: W.red, fontSize: 12.5, marginBottom: 8 }}>{error}</div>
+              <Btn small kind="ghost" onClick={load}>Retry</Btn>
+            </div>
+          )}
+          {!loading && !error && entries !== null && (
+            <>
+              <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4, marginBottom: 12 }}>
+                {entities.map(e => (
+                  <button key={e} onClick={() => setFilter(e)} style={{
+                    whiteSpace: "nowrap", padding: "5px 12px", borderRadius: 20, fontSize: 11.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+                    border: filter === e ? "none" : `1px solid ${W.border}`,
+                    background: filter === e ? W.wine : "transparent", color: filter === e ? "#fff" : W.muted,
+                  }}>{e === "all" ? "All" : e.charAt(0).toUpperCase() + e.slice(1)}</button>
+                ))}
+                <button onClick={load} style={{ marginLeft: "auto", background: "none", border: "none", color: W.wine, fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", flexShrink: 0 }}>↻ Refresh</button>
+              </div>
+
+              {filtered.length === 0 ? (
+                <div style={{ textAlign: "center", color: W.muted, fontSize: 12.5, padding: "16px 0" }}>No activity recorded yet.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 420, overflowY: "auto" }}>
+                  {filtered.map(e => (
+                    <div key={e.id} style={{ display: "flex", gap: 10, padding: "9px 4px", borderBottom: `1px solid ${W.blush}` }}>
+                      <span style={{ width: 26, height: 26, borderRadius: "50%", background: W.blush, color: AUDIT_COLOR[e.action] || W.wine, fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{AUDIT_ICON[e.action] || "•"}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 12.5, color: W.ink, lineHeight: 1.4 }}>{e.summary}</div>
+                        <div style={{ fontSize: 10.5, color: W.muted, marginTop: 2 }}>{e.actor || "Unknown"} {e.role === "sales" ? "(sales)" : ""} · {timeAgo(e.at)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Settings({ db, setDb, showToast, onLogout, session }) {
   const { settings } = db;
   const [form, setForm] = useState(settings);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -1338,6 +1490,7 @@ function Settings({ db, setDb, showToast, onLogout }) {
   const saveSettings = () => {
     setDb(prev => ({ ...prev, settings: form }));
     queueUpsert("settings", form);
+    logAudit({ actor: session?.name, role: session?.role, action: "updated", entity: "settings", entityId: "settings", summary: `Updated boutique profile (${form.shopName})` });
     showToast("Settings saved");
   };
 
@@ -1364,6 +1517,7 @@ function Settings({ db, setDb, showToast, onLogout }) {
         (p.data.customers||[]).forEach(x => queueUpsert("customers", x));
         (p.data.staff||[]).forEach(x => queueUpsert("staff", x));
         if (p.data.settings) queueUpsert("settings", p.data.settings);
+        logAudit({ actor: session?.name, role: session?.role, action: "restore", entity: "data", entityId: "all", summary: `Restored data from backup dated ${new Date(p.exportedAt).toLocaleString("en-GH")}` });
         showToast("Data restored and syncing to cloud");
       } catch { showToast("Could not read file", "err"); }
     };
@@ -1389,7 +1543,7 @@ function Settings({ db, setDb, showToast, onLogout }) {
         </div>
       </div>
 
-      <StaffManagement db={db} setDb={setDb} showToast={showToast} />
+      <StaffManagement db={db} setDb={setDb} showToast={showToast} session={session} />
 
       {/* Profile */}
       <div style={{ background: "#fff", borderRadius: 16, padding: 20, border: `1px solid ${W.border}`, marginBottom: 16 }}>
@@ -1419,6 +1573,8 @@ function Settings({ db, setDb, showToast, onLogout }) {
         </div>
       </div>
 
+      <AuditTrail />
+
       {/* Danger zone */}
       <div style={{ background: W.redBg, borderRadius: 16, padding: 20, border: `1px solid #f0c0c0`, marginBottom: 16 }}>
         <div style={{ fontSize: 14, fontWeight: 700, color: W.red, marginBottom: 6 }}>Reset Everything</div>
@@ -1428,7 +1584,12 @@ function Settings({ db, setDb, showToast, onLogout }) {
         ) : (
           <div style={{ display: "flex", gap: 10 }}>
             <Btn kind="ghost" onClick={() => setConfirmReset(false)} style={{ flex: 1 }}>Cancel</Btn>
-            <Btn kind="danger" style={{ flex: 1 }} onClick={async () => { localStorage.removeItem(STORAGE_KEY); localStorage.removeItem("tws_cache_v1"); localStorage.removeItem("tws_outbox_v1"); const fresh = seed(); setDb(fresh); setConfirmReset(false); showToast("Clearing cloud data…"); try { await clearCloud(); showToast("All data reset"); } catch { showToast("Local data reset — cloud clear failed, check connection", "err"); } }}>Yes, delete all</Btn>
+            <Btn kind="danger" style={{ flex: 1 }} onClick={async () => {
+              logAudit({ actor: session?.name, role: session?.role, action: "reset", entity: "data", entityId: "all", summary: "Reset all data (products, sales, clients, staff)" });
+              localStorage.removeItem(STORAGE_KEY); localStorage.removeItem("tws_cache_v1"); localStorage.removeItem("tws_outbox_v1");
+              const fresh = seed(); setDb(fresh); setConfirmReset(false); showToast("Clearing cloud data…");
+              try { await clearCloud(); showToast("All data reset"); } catch { showToast("Local data reset — cloud clear failed, check connection", "err"); }
+            }}>Yes, delete all</Btn>
           </div>
         )}
       </div>
@@ -1439,3 +1600,4 @@ function Settings({ db, setDb, showToast, onLogout }) {
     </div>
   );
 }
+
