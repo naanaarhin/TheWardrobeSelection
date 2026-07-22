@@ -36,8 +36,8 @@ function enqueue(op) {
 export function pendingCount() { return loadOutbox().length; }
 
 // ── Table row mappers (app shape <-> Supabase row shape) ────────────────────
-const toProductRow = (p) => ({ id: p.id, shop_id: SHOP_ID, name: p.name, category: p.category, sku: p.sku, cost: p.cost, price: p.price, qty: p.qty, threshold: p.threshold, size: p.size, color: p.color, updated_at: new Date().toISOString() });
-const fromProductRow = (r) => ({ id: r.id, name: r.name, category: r.category, sku: r.sku, cost: r.cost, price: r.price, qty: r.qty, threshold: r.threshold, size: r.size, color: r.color });
+const toProductRow = (p) => ({ id: p.id, shop_id: SHOP_ID, name: p.name, category: p.category, sku: p.sku, cost: p.cost, price: p.price, qty: p.qty, threshold: p.threshold, size: p.size, color: p.color, sizes: p.sizes || [], updated_at: new Date().toISOString() });
+const fromProductRow = (r) => ({ id: r.id, name: r.name, category: r.category, sku: r.sku, cost: r.cost, price: r.price, qty: r.qty, threshold: r.threshold, size: r.size, color: r.color, sizes: r.sizes || [] });
 
 const toSaleRow = (s) => ({ id: s.id, shop_id: SHOP_ID, date: s.date, items: s.items, subtotal: s.subtotal, discount: s.discount, total: s.total, profit: s.profit, pay_method: s.payMethod, customer_id: s.customerId, customer_name: s.customerName, sold_by: s.soldBy, channel: s.channel || "walkin" });
 const fromSaleRow = (r) => ({ id: r.id, date: r.date, items: r.items, subtotal: r.subtotal, discount: r.discount, total: r.total, profit: r.profit, payMethod: r.pay_method, customerId: r.customer_id, customerName: r.customer_name, soldBy: r.sold_by, channel: r.channel || "walkin" });
@@ -48,8 +48,8 @@ const fromCustomerRow = (r) => ({ id: r.id, name: r.name, phone: r.phone, note: 
 const toStaffRow = (s) => ({ id: s.id, shop_id: SHOP_ID, name: s.name, pin: s.pin, updated_at: new Date().toISOString() });
 const fromStaffRow = (r) => ({ id: r.id, name: r.name, pin: r.pin });
 
-const toSettingsRow = (s) => ({ shop_id: SHOP_ID, shop_name: s.shopName, location: s.location, phone: s.phone, updated_at: new Date().toISOString() });
-const fromSettingsRow = (r) => ({ shopName: r.shop_name, location: r.location, phone: r.phone, lowStockAlerts: true });
+const toSettingsRow = (s) => ({ shop_id: SHOP_ID, shop_name: s.shopName, location: s.location, phone: s.phone, custom_categories: s.customCategories || [], updated_at: new Date().toISOString() });
+const fromSettingsRow = (r) => ({ shopName: r.shop_name, location: r.location, phone: r.phone, lowStockAlerts: true, customCategories: r.custom_categories || [] });
 
 const toAuditRow = (a) => ({ id: a.id, shop_id: SHOP_ID, at: a.at, actor: a.actor, role: a.role, action: a.action, entity: a.entity, entity_id: a.entityId, summary: a.summary });
 const fromAuditRow = (r) => ({ id: r.id, at: r.at, actor: r.actor, role: r.role, action: r.action, entity: r.entity, entityId: r.entity_id, summary: r.summary });
@@ -76,7 +76,7 @@ export async function pullAll() {
     sales: (sales.data || []).map(fromSaleRow),
     customers: (customers.data || []).map(fromCustomerRow),
     staff: (staff.data || []).map(fromStaffRow),
-    settings: settingsRes.data ? fromSettingsRow(settingsRes.data) : { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true },
+    settings: settingsRes.data ? fromSettingsRow(settingsRes.data) : { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true, customCategories: [] },
     returns: (returns.data || []).map(fromReturnRow),
   };
 }

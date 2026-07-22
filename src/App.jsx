@@ -62,7 +62,7 @@ function seed() {
     expenses: [],
     staff: [],
     returns: [],
-    settings: { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true },
+    settings: { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true, customCategories: [] },
   };
 }
 
@@ -365,6 +365,27 @@ export default function App() {
   const login = (s) => { sessionStorage.setItem(AUTH_KEY, JSON.stringify(s)); setSession(s); setTab(s.role === "sales" ? "sell" : "dashboard"); };
   const logout = () => { sessionStorage.removeItem(AUTH_KEY); setSession(null); };
 
+  // Auto-lock after 2 minutes of no activity. Any tap, click, key press, or
+  // scroll resets the timer. Runs only while a session is active.
+  const AUTO_LOCK_MS = 2 * 60 * 1000;
+  const lastActivityRef = useRef(Date.now());
+  useEffect(() => {
+    if (!session) return;
+    lastActivityRef.current = Date.now();
+    const markActive = () => { lastActivityRef.current = Date.now(); };
+    const events = ["mousedown", "keydown", "touchstart", "scroll"];
+    events.forEach(ev => window.addEventListener(ev, markActive, { passive: true }));
+    const interval = setInterval(() => {
+      if (Date.now() - lastActivityRef.current >= AUTO_LOCK_MS) {
+        logout();
+      }
+    }, 5000);
+    return () => {
+      events.forEach(ev => window.removeEventListener(ev, markActive));
+      clearInterval(interval);
+    };
+  }, [session]);
+
   if (!session) return <LoginScreen staff={db.staff || []} onLogin={login} />;
 
   const isAdmin = session.role === "admin";
@@ -463,8 +484,20 @@ function Dashboard({ db, setTab }) {
     const todayRevenue = todaySales.reduce((a, s) => a + s.total, 0);
     const stockValue = products.reduce((a, p) => a + p.cost * p.qty, 0);
     const retailValue = products.reduce((a, p) => a + p.price * p.qty, 0);
-    const lowStock = products.filter(p => p.qty <= p.threshold && p.qty > 0);
-    const outStock = products.filter(p => p.qty <= 0);
+
+    // Flatten into one restock "line" per size (or one per product if it has no sizes),
+    // so low/out-of-stock alerts are precise down to the specific size.
+    const restockLines = [];
+    products.forEach(p => {
+      if (p.sizes && p.sizes.length > 0) {
+        p.sizes.forEach(s => restockLines.push({ productId: p.id, productName: p.name, size: s.size, qty: s.qty, threshold: p.threshold, category: p.category }));
+      } else {
+        restockLines.push({ productId: p.id, productName: p.name, size: null, qty: p.qty, threshold: p.threshold, category: p.category });
+      }
+    });
+    const lowStock = restockLines.filter(l => l.qty <= l.threshold && l.qty > 0);
+    const outStock = restockLines.filter(l => l.qty <= 0);
+
     const totalRevenue = sales.reduce((a, s) => a + s.total, 0);
     const totalProfit = sales.reduce((a, s) => a + (s.profit || 0), 0);
     const totalUnits = products.reduce((a, p) => a + p.qty, 0);
@@ -577,30 +610,32 @@ function Dashboard({ db, setTab }) {
             <button onClick={() => setShowRestock(true)} style={{ background: "#fff", border: `1px solid #f0d59c`, borderRadius: 8, padding: "5px 11px", fontSize: 11.5, fontWeight: 700, color: W.amber, cursor: "pointer", fontFamily: "inherit" }}>Generate List →</button>
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            {[...stats.outStock, ...stats.lowStock].slice(0, 8).map(p => (
-              <Pill key={p.id} bg="#fff" color={p.qty <= 0 ? W.red : W.amber}>{p.name} · {p.qty} left</Pill>
+            {[...stats.outStock, ...stats.lowStock].slice(0, 8).map((l, i) => (
+              <Pill key={i} bg="#fff" color={l.qty <= 0 ? W.red : W.amber}>{l.productName}{l.size ? ` (${l.size})` : ""} · {l.qty} left</Pill>
             ))}
           </div>
         </div>
       )}
 
-      {showRestock && <RestockListModal items={[...stats.outStock, ...stats.lowStock]} onClose={() => setShowRestock(false)} />}
+      {showRestock && <RestockListModal lines={[...stats.outStock, ...stats.lowStock]} onClose={() => setShowRestock(false)} />}
     </div>
   );
 }
 
 // ── RESTOCK LIST MODAL ────────────────────────────────────────────────────────
-function RestockListModal({ items, onClose }) {
-  const suggested = items.map(p => ({ ...p, reorderQty: Math.max(p.threshold * 2 - p.qty, p.threshold, 1) }));
+function RestockListModal({ lines, onClose }) {
+  const suggested = lines.map(l => ({ ...l, reorderQty: Math.max(l.threshold * 2 - l.qty, l.threshold, 1) }));
+
+  const lineLabel = (l) => `${l.productName}${l.size ? ` (${l.size})` : ""}`;
 
   const asText = () => {
-    const lines = [
+    const out = [
       "THE WARDROBE SELECTION — Restock List",
       new Date().toLocaleDateString("en-GH", { dateStyle: "full" }),
       "",
-      ...suggested.map(p => `• ${p.name}${p.size && p.size !== "—" ? ` (${p.size})` : ""} — have ${p.qty}, order ${p.reorderQty}`),
+      ...suggested.map(l => `• ${lineLabel(l)} — have ${l.qty}, order ${l.reorderQty}`),
     ];
-    return lines.join("\n");
+    return out.join("\n");
   };
 
   const copyList = async () => {
@@ -608,7 +643,7 @@ function RestockListModal({ items, onClose }) {
   };
 
   const exportCSV = () => {
-    const rows = [["Product", "Category", "Size", "Current Qty", "Threshold", "Suggested Reorder"], ...suggested.map(p => [p.name, p.category, p.size || "—", p.qty, p.threshold, p.reorderQty])];
+    const rows = [["Product", "Size", "Category", "Current Qty", "Threshold", "Suggested Reorder"], ...suggested.map(l => [l.productName, l.size || "—", l.category, l.qty, l.threshold, l.reorderQty])];
     const csv = rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
     const a = document.createElement("a");
     a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
@@ -616,25 +651,79 @@ function RestockListModal({ items, onClose }) {
     document.body.appendChild(a); a.click(); a.remove();
   };
 
+  const savePDF = async () => {
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const pageW = doc.internal.pageSize.getWidth();
+    const marginX = 40;
+    let y = 56;
+
+    // Header band
+    doc.setFillColor(74, 30, 36); // wine dark
+    doc.rect(0, 0, pageW, 70, "F");
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.text("The Wardrobe Selection", marginX, 30);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.text("Restock List", marginX, 48);
+    doc.text(new Date().toLocaleDateString("en-GH", { dateStyle: "full" }), pageW - marginX, 48, { align: "right" });
+
+    y = 100;
+    doc.setTextColor(42, 20, 24);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.text("Item", marginX, y);
+    doc.text("Have", pageW - 220, y);
+    doc.text("Order", pageW - 140, y);
+    doc.text("Category", pageW - 60, y, { align: "right" });
+    y += 8;
+    doc.setDrawColor(232, 204, 204);
+    doc.line(marginX, y, pageW - marginX, y);
+    y += 18;
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    suggested.forEach((l, i) => {
+      if (y > 780) { doc.addPage(); y = 50; }
+      const isOut = l.qty <= 0;
+      doc.setTextColor(42, 20, 24);
+      doc.text(lineLabel(l), marginX, y, { maxWidth: pageW - 300 });
+      doc.setTextColor(isOut ? 197 : 183, isOut ? 48 : 121, isOut ? 48 : 31);
+      doc.text(String(l.qty), pageW - 220, y);
+      doc.setTextColor(114, 47, 55);
+      doc.setFont("helvetica", "bold");
+      doc.text(`+${l.reorderQty}`, pageW - 140, y);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(122, 98, 101);
+      doc.text(l.category || "", pageW - 60, y, { align: "right" });
+      y += 22;
+    });
+
+    doc.save(`TWS-restock-list-${todayISO()}.pdf`);
+  };
+
   return (
     <Modal title="Restock List" subtitle={`${suggested.length} item${suggested.length !== 1 ? "s" : ""} need attention`} onClose={onClose} wide>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 380, overflowY: "auto", marginBottom: 16 }}>
-        {suggested.map(p => (
-          <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10 }}>
+        {suggested.map((l, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10 }}>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 13.5, fontWeight: 700, color: W.ink }}>{p.name}</div>
-              <div style={{ fontSize: 11, color: W.muted }}>{p.category}{p.size && p.size !== "—" ? ` · ${p.size}` : ""} · have {p.qty}</div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: W.ink }}>{lineLabel(l)}</div>
+              <div style={{ fontSize: 11, color: W.muted }}>{l.category} · have {l.qty}</div>
             </div>
             <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: 15, fontWeight: 800, color: p.qty <= 0 ? W.red : W.amber, fontFamily: "'Playfair Display', serif" }}>+{p.reorderQty}</div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: l.qty <= 0 ? W.red : W.amber, fontFamily: "'Playfair Display', serif" }}>+{l.reorderQty}</div>
               <div style={{ fontSize: 9.5, color: W.muted }}>suggested</div>
             </div>
           </div>
         ))}
       </div>
       <div style={{ display: "flex", gap: 10 }}>
-        <Btn kind="ghost" onClick={copyList} style={{ flex: 1 }}>📋 Copy as Text</Btn>
-        <Btn kind="gold" onClick={exportCSV} style={{ flex: 1 }}>↓ Export CSV</Btn>
+        <Btn kind="ghost" onClick={copyList} style={{ flex: 1 }}>📋 Copy</Btn>
+        <Btn kind="subtle" onClick={exportCSV} style={{ flex: 1 }}>↓ CSV</Btn>
+        <Btn kind="gold" onClick={savePDF} style={{ flex: 1 }}>↓ PDF</Btn>
       </div>
     </Modal>
   );
@@ -654,13 +743,19 @@ function SectionTitle({ title, subtitle, action }) {
 
 // ── INVENTORY ────────────────────────────────────────────────────────────────
 function Inventory({ db, setDb, showToast, session }) {
-  const { products } = db;
+  const { products, settings } = db;
+  const customCategories = settings?.customCategories || [];
+  const allCategories = [...CATEGORIES, ...customCategories];
+
   const [search, setSearch] = useState("");
   const [cat, setCat] = useState("All");
   const [editing, setEditing] = useState(null);
   const [showModal, setShowModal] = useState(false);
+  const [showSizePopup, setShowSizePopup] = useState(false);
+  const [showNewCatPopup, setShowNewCatPopup] = useState(false);
+  const [newCatName, setNewCatName] = useState("");
 
-  const blank = { name: "", category: "Dresses", sku: "", cost: "", price: "", qty: "", threshold: 3, size: "", color: "" };
+  const blank = { name: "", category: "Dresses", sku: "", cost: "", price: "", qty: "", threshold: 3, size: "", color: "", sizes: [] };
   const [form, setForm] = useState(blank);
 
   const filtered = products.filter(p =>
@@ -669,17 +764,39 @@ function Inventory({ db, setDb, showToast, session }) {
   );
 
   const openAdd = () => { setForm(blank); setEditing(null); setShowModal(true); };
-  const openEdit = (p) => { setForm({ ...p }); setEditing(p.id); setShowModal(true); };
+  const openEdit = (p) => { setForm({ ...p, sizes: p.sizes || [] }); setEditing(p.id); setShowModal(true); };
+
+  const saveNewCategory = () => {
+    const name = newCatName.trim();
+    if (!name) return;
+    if (allCategories.some(c => c.toLowerCase() === name.toLowerCase())) {
+      showToast("That category already exists", "err");
+      return;
+    }
+    const updated = [...customCategories, name];
+    setDb(prev => ({ ...prev, settings: { ...prev.settings, customCategories: updated } }));
+    queueUpsert("settings", { ...settings, customCategories: updated });
+    logAudit({ actor: session?.name, role: session?.role, action: "created", entity: "settings", entityId: "category", summary: `Added new category "${name}"` });
+    setForm(f => ({ ...f, category: name }));
+    setNewCatName("");
+    setShowNewCatPopup(false);
+    showToast("Category added");
+  };
 
   const save = () => {
     if (!form.name.trim()) { showToast("Product name is required", "err"); return; }
+    const hasSizes = form.sizes && form.sizes.length > 0;
+    const totalQty = hasSizes ? form.sizes.reduce((a, s) => a + (Number(s.qty) || 0), 0) : (Number(form.qty) || 0);
+    const sizeLabel = hasSizes ? form.sizes.map(s => s.size).join(", ") : form.size;
     const item = {
       ...form,
       id: editing || uid(),
       cost: Number(form.cost) || 0,
       price: Number(form.price) || 0,
-      qty: Number(form.qty) || 0,
+      qty: totalQty,
       threshold: Number(form.threshold) || 0,
+      size: sizeLabel,
+      sizes: hasSizes ? form.sizes.map(s => ({ size: s.size, qty: Number(s.qty) || 0 })) : [],
     };
     setDb(prev => ({ ...prev, products: editing ? prev.products.map(p => p.id === editing ? item : p) : [item, ...prev.products] }));
     queueUpsert("products", item);
@@ -697,7 +814,18 @@ function Inventory({ db, setDb, showToast, session }) {
     showToast("Product removed");
   };
 
-  const cats = ["All", ...CATEGORIES];
+  const cats = ["All", ...allCategories];
+  const hasSizes = form.sizes && form.sizes.length > 0;
+
+  // Worst-case stock status across a product's sizes (for the list row's dot)
+  const productStockStatus = (p) => {
+    if (p.sizes && p.sizes.length > 0) {
+      const outAny = p.sizes.some(s => s.qty <= 0);
+      const lowAny = p.sizes.some(s => s.qty > 0 && s.qty <= p.threshold);
+      return outAny ? { qty: 0, threshold: p.threshold } : lowAny ? { qty: p.threshold, threshold: p.threshold } : { qty: p.threshold + 1, threshold: p.threshold };
+    }
+    return { qty: p.qty, threshold: p.threshold };
+  };
 
   return (
     <div>
@@ -717,25 +845,28 @@ function Inventory({ db, setDb, showToast, session }) {
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {filtered.length === 0 && <div style={{ textAlign: "center", color: W.muted, padding: 40, fontSize: 14 }}>No products found.</div>}
-        {filtered.map(p => (
-          <div key={p.id} onClick={() => openEdit(p)} style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", border: `1px solid ${W.border}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 14 }}>
-            <div style={{ width: 46, height: 46, borderRadius: 11, background: `linear-gradient(135deg, ${W.blush}, ${W.blushDk})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>
-              {catIcon(p.category)}
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 14.5, fontWeight: 700, color: W.ink, marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
-              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11.5, color: W.muted }}>{p.category}</span>
-                {p.size && p.size !== "—" && <span style={{ fontSize: 11.5, color: W.muted }}>· {p.size}</span>}
-                <StockDot qty={p.qty} threshold={p.threshold} />
+        {filtered.map(p => {
+          const stockStat = productStockStatus(p);
+          return (
+            <div key={p.id} onClick={() => openEdit(p)} style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", border: `1px solid ${W.border}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 14 }}>
+              <div style={{ width: 46, height: 46, borderRadius: 11, background: `linear-gradient(135deg, ${W.blush}, ${W.blushDk})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>
+                {catIcon(p.category)}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14.5, fontWeight: 700, color: W.ink, marginBottom: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 11.5, color: W.muted }}>{p.category}</span>
+                  {p.size && p.size !== "—" && <span style={{ fontSize: 11.5, color: W.muted }}>· {p.size}</span>}
+                  <StockDot qty={stockStat.qty} threshold={stockStat.threshold} />
+                </div>
+              </div>
+              <div style={{ textAlign: "right", flexShrink: 0 }}>
+                <div style={{ fontSize: 15, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif" }}>{GHS(p.price)}</div>
+                <div style={{ fontSize: 11, color: W.muted, marginTop: 2 }}>{p.qty} in stock{p.sizes?.length > 0 ? ` · ${p.sizes.length} sizes` : ""}</div>
               </div>
             </div>
-            <div style={{ textAlign: "right", flexShrink: 0 }}>
-              <div style={{ fontSize: 15, fontWeight: 800, color: W.wine, fontFamily: "'Playfair Display', serif" }}>{GHS(p.price)}</div>
-              <div style={{ fontSize: 11, color: W.muted, marginTop: 2 }}>{p.qty} in stock</div>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {showModal && (
@@ -743,8 +874,12 @@ function Inventory({ db, setDb, showToast, session }) {
           <Field label="Product Name"><input style={inputStyle} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Ankara Maxi Dress" /></Field>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <Field label="Category">
-              <select style={inputStyle} value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}>
-                {CATEGORIES.map(c => <option key={c}>{c}</option>)}
+              <select style={inputStyle} value={form.category} onChange={e => {
+                if (e.target.value === "__new__") { setShowNewCatPopup(true); return; }
+                setForm(f => ({ ...f, category: e.target.value }));
+              }}>
+                {allCategories.map(c => <option key={c}>{c}</option>)}
+                <option value="__new__">+ Add New Category…</option>
               </select>
             </Field>
             <Field label="SKU / Code"><input style={inputStyle} value={form.sku} onChange={e => setForm(f => ({ ...f, sku: e.target.value }))} placeholder="TWS-XX-000" /></Field>
@@ -753,11 +888,25 @@ function Inventory({ db, setDb, showToast, session }) {
             <Field label="Cost Price (GH₵)"><input type="number" style={inputStyle} value={form.cost} onChange={e => setForm(f => ({ ...f, cost: e.target.value }))} placeholder="0.00" /></Field>
             <Field label="Selling Price (GH₵)"><input type="number" style={inputStyle} value={form.price} onChange={e => setForm(f => ({ ...f, price: e.target.value }))} placeholder="0.00" /></Field>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-            <Field label="Quantity"><input type="number" style={inputStyle} value={form.qty} onChange={e => setForm(f => ({ ...f, qty: e.target.value }))} placeholder="0" /></Field>
+
+          <div style={{ display: "grid", gridTemplateColumns: hasSizes ? "1fr 1fr" : "1fr 1fr 1fr", gap: 12 }}>
+            {!hasSizes && <Field label="Quantity"><input type="number" style={inputStyle} value={form.qty} onChange={e => setForm(f => ({ ...f, qty: e.target.value }))} placeholder="0" /></Field>}
             <Field label="Low Alert"><input type="number" style={inputStyle} value={form.threshold} onChange={e => setForm(f => ({ ...f, threshold: e.target.value }))} placeholder="3" /></Field>
-            <Field label="Size"><input style={inputStyle} value={form.size} onChange={e => setForm(f => ({ ...f, size: e.target.value }))} placeholder="M / 39" /></Field>
+            <Field label="Size">
+              <button type="button" onClick={() => setShowSizePopup(true)} style={{ ...inputStyle, textAlign: "left", cursor: "pointer", color: hasSizes ? W.ink : W.muted, background: "#fff" }}>
+                {hasSizes ? `${form.sizes.length} size${form.sizes.length !== 1 ? "s" : ""} set` : (form.size || "Tap to set size(s)")}
+              </button>
+            </Field>
           </div>
+
+          {hasSizes && (
+            <div style={{ background: W.blush, borderRadius: 10, padding: "10px 14px", marginBottom: 14, display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {form.sizes.map((s, i) => (
+                <Pill key={i} bg="#fff" color={s.qty <= form.threshold ? (s.qty <= 0 ? W.red : W.amber) : W.wine}>{s.size}: {s.qty}</Pill>
+              ))}
+            </div>
+          )}
+
           <Field label="Colour"><input style={inputStyle} value={form.color} onChange={e => setForm(f => ({ ...f, color: e.target.value }))} placeholder="e.g. Wine" /></Field>
 
           {form.cost && form.price && (
@@ -774,7 +923,72 @@ function Inventory({ db, setDb, showToast, session }) {
           </div>
         </Modal>
       )}
+
+      {showSizePopup && (
+        <SizePopup
+          initial={form.sizes || []}
+          singleSize={form.size}
+          onClose={() => setShowSizePopup(false)}
+          onSave={(sizes) => { setForm(f => ({ ...f, sizes })); setShowSizePopup(false); }}
+        />
+      )}
+
+      {showNewCatPopup && (
+        <Modal title="Add New Category" onClose={() => setShowNewCatPopup(false)}>
+          <Field label="Category Name">
+            <input style={inputStyle} value={newCatName} onChange={e => setNewCatName(e.target.value)} placeholder="e.g. Kids Wear" autoFocus />
+          </Field>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Btn kind="ghost" onClick={() => setShowNewCatPopup(false)} style={{ flex: 1 }}>Cancel</Btn>
+            <Btn onClick={saveNewCategory} style={{ flex: 1 }}>Add Category</Btn>
+          </div>
+        </Modal>
+      )}
     </div>
+  );
+}
+
+// ── SIZE POPUP (per-size quantity entry) ──────────────────────────────────────
+function SizePopup({ initial, singleSize, onClose, onSave }) {
+  const [rows, setRows] = useState(() => {
+    if (initial && initial.length > 0) return initial.map(s => ({ ...s }));
+    if (singleSize) return [{ size: singleSize, qty: 0 }];
+    return [{ size: "", qty: 0 }];
+  });
+
+  const updateRow = (i, field, val) => setRows(prev => prev.map((r, idx) => idx === i ? { ...r, [field]: val } : r));
+  const addRow = () => setRows(prev => [...prev, { size: "", qty: 0 }]);
+  const removeRow = (i) => setRows(prev => prev.filter((_, idx) => idx !== i));
+
+  const save = () => {
+    const clean = rows.map(r => ({ size: (r.size || "").trim(), qty: Number(r.qty) || 0 })).filter(r => r.size);
+    onSave(clean);
+  };
+
+  const total = rows.reduce((a, r) => a + (Number(r.qty) || 0), 0);
+
+  return (
+    <Modal title="Sizes & Quantities" subtitle="Add each size this item comes in, with its own stock count" onClose={onClose}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14 }}>
+        {rows.map((r, i) => (
+          <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input style={{ ...inputStyle, flex: 2 }} value={r.size} onChange={e => updateRow(i, "size", e.target.value)} placeholder="e.g. M / 39 / One Size" />
+            <input type="number" style={{ ...inputStyle, flex: 1 }} value={r.qty} onChange={e => updateRow(i, "qty", e.target.value)} placeholder="Qty" />
+            <button onClick={() => removeRow(i)} style={{ background: W.redBg, color: W.red, border: "none", borderRadius: 7, width: 34, height: 38, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>×</button>
+          </div>
+        ))}
+      </div>
+      <Btn kind="subtle" small onClick={addRow} style={{ marginBottom: 16 }}>+ Add Another Size</Btn>
+
+      <div style={{ background: W.blush, borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: W.wine, fontWeight: 700 }}>
+        Total stock across all sizes: {total}
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <Btn kind="ghost" onClick={onClose} style={{ flex: 1 }}>Cancel</Btn>
+        <Btn onClick={save} style={{ flex: 1 }}>Save Sizes</Btn>
+      </div>
+    </Modal>
   );
 }
 
@@ -831,16 +1045,30 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
   };
 
   const available = products.filter(p => p.qty > 0 && p.name.toLowerCase().includes(search.toLowerCase()));
+  const [sizePickFor, setSizePickFor] = useState(null); // product currently picking a size for
 
   const addToCart = (p) => {
+    if (p.sizes && p.sizes.length > 0) {
+      setSizePickFor(p);
+      return;
+    }
+    addSizeToCart(p, null);
+  };
+
+  const addSizeToCart = (p, sizeEntry) => {
+    const size = sizeEntry?.size || null;
+    const maxQty = sizeEntry ? sizeEntry.qty : p.qty;
+    const lineId = size ? `${p.id}::${size}` : p.id;
     setCart(prev => {
-      const ex = prev.find(x => x.id === p.id);
+      const ex = prev.find(x => x.id === lineId);
       if (ex) {
-        if (ex.qty >= p.qty) { showToast("No more stock available", "err"); return prev; }
-        return prev.map(x => x.id === p.id ? { ...x, qty: x.qty + 1 } : x);
+        if (ex.qty >= maxQty) { showToast("No more stock available for this size", "err"); return prev; }
+        return prev.map(x => x.id === lineId ? { ...x, qty: x.qty + 1 } : x);
       }
-      return [...prev, { id: p.id, name: p.name, price: p.price, cost: p.cost, qty: 1, max: p.qty }];
+      if (maxQty <= 0) { showToast("This size is out of stock", "err"); return prev; }
+      return [...prev, { id: lineId, productId: p.id, size, name: p.name, price: p.price, cost: p.cost, qty: 1, max: maxQty }];
     });
+    setSizePickFor(null);
   };
 
   const updateQty = (id, delta) => {
@@ -862,14 +1090,24 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
     if (cart.length === 0) { showToast("Cart is empty", "err"); return; }
     const cust = customers.find(c => c.id === customerId);
     const sale = {
-      id: uid(), date: nowStamp(), items: cart.map(({ id, name, price, cost, qty }) => ({ id, name, price, cost, qty })),
+      id: uid(), date: nowStamp(), items: cart.map(({ productId, size, name, price, cost, qty }) => ({ id: productId, size, name, price, cost, qty })),
       subtotal, discount: disc, total, profit, payMethod, channel,
       customerId: customerId || null, customerName: cust?.name || (channel === "online" ? "Online customer" : "Walk-in"),
       soldBy: session?.name || "Cynthia Naana Arhin",
     };
     const updatedProducts = products.map(p => {
-      const ci = cart.find(x => x.id === p.id);
-      return ci ? { ...p, qty: p.qty - ci.qty } : p;
+      const linesForThisProduct = cart.filter(x => x.productId === p.id);
+      if (linesForThisProduct.length === 0) return p;
+      if (p.sizes && p.sizes.length > 0) {
+        const newSizes = p.sizes.map(s => {
+          const line = linesForThisProduct.find(x => x.size === s.size);
+          return line ? { ...s, qty: Math.max(0, s.qty - line.qty) } : s;
+        });
+        const newTotal = newSizes.reduce((a, s) => a + s.qty, 0);
+        return { ...p, sizes: newSizes, qty: newTotal };
+      }
+      const deduction = linesForThisProduct.reduce((a, x) => a + x.qty, 0);
+      return { ...p, qty: p.qty - deduction };
     });
     const updatedCustomer = cust ? { ...cust, spent: (cust.spent||0) + total, visits: (cust.visits||0) + 1 } : null;
 
@@ -882,8 +1120,9 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
 
     // Sync: sale record, each affected product's new stock, and customer totals
     queueUpsert("sales", sale);
-    cart.forEach(ci => {
-      const p = updatedProducts.find(x => x.id === ci.id);
+    const touchedProductIds = new Set(cart.map(x => x.productId));
+    touchedProductIds.forEach(pid => {
+      const p = updatedProducts.find(x => x.id === pid);
       if (p) queueUpsert("products", p);
     });
     if (updatedCustomer) queueUpsert("customers", updatedCustomer);
@@ -927,14 +1166,31 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
         {available.slice(0, 12).map(p => (
           <button key={p.id} onClick={() => addToCart(p)} style={{ background: "#fff", border: `1px solid ${W.border}`, borderRadius: 12, padding: "12px 10px", cursor: "pointer", textAlign: "left", fontFamily: "inherit" }}>
             <div style={{ fontSize: 22, marginBottom: 6 }}>{catIcon(p.category)}</div>
-            <div style={{ fontSize: 12.5, fontWeight: 700, color: W.ink, lineHeight: 1.2, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+            <div style={{ fontSize: 12.5, fontWeight: 700, color: W.ink, lineHeight: 1.2, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}{p.sizes?.length > 0 ? " ▸" : ""}</div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span style={{ fontSize: 13, fontWeight: 800, color: W.wine }}>{GHS(p.price)}</span>
-              <span style={{ fontSize: 10.5, color: W.muted }}>{p.qty} left</span>
+              <span style={{ fontSize: 10.5, color: W.muted }}>{p.sizes?.length > 0 ? `${p.sizes.length} sizes` : `${p.qty} left`}</span>
             </div>
           </button>
         ))}
       </div>
+
+      {sizePickFor && (
+        <Modal title={`Choose Size`} subtitle={sizePickFor.name} onClose={() => setSizePickFor(null)}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {sizePickFor.sizes.map((s, i) => (
+              <button key={i} disabled={s.qty <= 0} onClick={() => addSizeToCart(sizePickFor, s)} style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px",
+                borderRadius: 10, border: `1px solid ${W.border}`, background: s.qty <= 0 ? W.blush : "#fff",
+                cursor: s.qty <= 0 ? "not-allowed" : "pointer", fontFamily: "inherit", opacity: s.qty <= 0 ? 0.5 : 1,
+              }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color: W.ink }}>{s.size}</span>
+                <span style={{ fontSize: 12.5, color: s.qty <= 0 ? W.red : W.muted }}>{s.qty <= 0 ? "Out of stock" : `${s.qty} available`}</span>
+              </button>
+            ))}
+          </div>
+        </Modal>
+      )}
 
       {/* Cart */}
       {cart.length > 0 && (
@@ -946,7 +1202,7 @@ function NewSale({ db, setDb, showToast, setTab, session, isAdmin }) {
           {cart.map(x => (
             <div key={x.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: `1px solid ${W.blush}` }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 600, color: W.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.name}</div>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: W.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.name}{x.size ? ` — ${x.size}` : ""}</div>
                 <div style={{ fontSize: 12, color: W.muted }}>{GHS(x.price)} each</div>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1091,10 +1347,13 @@ function SalesHistory({ db, setDb, showToast, session }) {
   const [view, setView] = useState(null);
   const [showReturn, setShowReturn] = useState(false);
 
-  // How much of each item in a sale has already been returned
+  // How much of each item in a sale has already been returned, keyed by product+size
   const returnedQtyFor = (saleId) => {
     const map = {};
-    returns.filter(r => r.saleId === saleId).forEach(r => r.items.forEach(it => { map[it.id] = (map[it.id] || 0) + it.qty; }));
+    returns.filter(r => r.saleId === saleId).forEach(r => r.items.forEach(it => {
+      const key = `${it.id}::${it.size || ""}`;
+      map[key] = (map[key] || 0) + it.qty;
+    }));
     return map;
   };
 
@@ -1127,15 +1386,15 @@ function SalesHistory({ db, setDb, showToast, session }) {
 
       {view && !showReturn && (() => {
         const returnedMap = returnedQtyFor(view.id);
-        const anyReturnable = view.items.some(it => (returnedMap[it.id] || 0) < it.qty);
+        const anyReturnable = view.items.some(it => (returnedMap[`${it.id}::${it.size || ""}`] || 0) < it.qty);
         return (
           <Modal title="Sale Details" subtitle={`#${view.id.slice(-6).toUpperCase()} · ${view.customerName}`} onClose={() => setView(null)}>
             <div style={{ fontSize: 12, color: W.muted, marginBottom: 14 }}>{new Date(view.date).toLocaleString("en-GH", { dateStyle: "full", timeStyle: "short" })}{view.soldBy ? ` · Sold by ${view.soldBy}` : ""}{view.channel === "online" ? " · Online order" : ""}</div>
             {view.items.map((it, i) => {
-              const returnedQty = returnedMap[it.id] || 0;
+              const returnedQty = returnedMap[`${it.id}::${it.size || ""}`] || 0;
               return (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "8px 0", borderBottom: `1px solid ${W.blush}` }}>
-                  <span>{it.qty} × {it.name}{returnedQty > 0 && <span style={{ color: W.red, fontSize: 11.5, marginLeft: 6 }}>({returnedQty} returned)</span>}</span>
+                  <span>{it.qty} × {it.name}{it.size ? ` (${it.size})` : ""}{returnedQty > 0 && <span style={{ color: W.red, fontSize: 11.5, marginLeft: 6 }}>({returnedQty} returned)</span>}</span>
                   <span style={{ fontWeight: 600 }}>{GHS(it.price * it.qty)}</span>
                 </div>
               );
@@ -1175,17 +1434,18 @@ function SalesHistory({ db, setDb, showToast, session }) {
 
 // ── RETURN / REFUND MODAL ─────────────────────────────────────────────────────
 function ReturnModal({ sale, alreadyReturned, onClose, onDone, db, setDb, showToast, session }) {
+  const lineKey = (it) => `${it.id}::${it.size || ""}`;
   const [qtys, setQtys] = useState(() => {
     const q = {};
-    sale.items.forEach(it => { q[it.id] = 0; });
+    sale.items.forEach(it => { q[lineKey(it)] = 0; });
     return q;
   });
   const [reason, setReason] = useState("");
 
-  const maxFor = (it) => it.qty - (alreadyReturned[it.id] || 0);
-  const setQty = (id, val, max) => setQtys(p => ({ ...p, [id]: Math.max(0, Math.min(max, val)) }));
+  const maxFor = (it) => it.qty - (alreadyReturned[lineKey(it)] || 0);
+  const setQty = (key, val, max) => setQtys(p => ({ ...p, [key]: Math.max(0, Math.min(max, val)) }));
 
-  const returnItems = sale.items.filter(it => qtys[it.id] > 0).map(it => ({ id: it.id, name: it.name, price: it.price, cost: it.cost, qty: qtys[it.id] }));
+  const returnItems = sale.items.filter(it => qtys[lineKey(it)] > 0).map(it => ({ id: it.id, size: it.size || null, name: it.name, price: it.price, cost: it.cost, qty: qtys[lineKey(it)] }));
   const refundTotal = returnItems.reduce((a, it) => a + it.price * it.qty, 0);
   const profitImpact = returnItems.reduce((a, it) => a + (it.price - it.cost) * it.qty, 0);
 
@@ -1197,10 +1457,20 @@ function ReturnModal({ sale, alreadyReturned, onClose, onDone, db, setDb, showTo
       refundTotal, reason: reason.trim(), processedBy: session?.name || "Cynthia Naana Arhin",
     };
 
-    // Restock returned items
+    // Restock returned items — into the specific size if the product uses sizes
     const updatedProducts = db.products.map(p => {
-      const ri = returnItems.find(x => x.id === p.id);
-      return ri ? { ...p, qty: p.qty + ri.qty } : p;
+      const itemsForProduct = returnItems.filter(x => x.id === p.id);
+      if (itemsForProduct.length === 0) return p;
+      if (p.sizes && p.sizes.length > 0) {
+        const newSizes = p.sizes.map(s => {
+          const ri = itemsForProduct.find(x => x.size === s.size);
+          return ri ? { ...s, qty: s.qty + ri.qty } : s;
+        });
+        const newTotal = newSizes.reduce((a, s) => a + s.qty, 0);
+        return { ...p, sizes: newSizes, qty: newTotal };
+      }
+      const addBack = itemsForProduct.reduce((a, x) => a + x.qty, 0);
+      return { ...p, qty: p.qty + addBack };
     });
 
     // Reduce customer's lifetime spend if this was tied to a client
@@ -1215,8 +1485,9 @@ function ReturnModal({ sale, alreadyReturned, onClose, onDone, db, setDb, showTo
     }));
 
     queueUpsert("returns", ret);
-    returnItems.forEach(ri => {
-      const p = updatedProducts.find(x => x.id === ri.id);
+    const touchedIds = new Set(returnItems.map(x => x.id));
+    touchedIds.forEach(pid => {
+      const p = updatedProducts.find(x => x.id === pid);
       if (p) queueUpsert("products", p);
     });
     if (updatedCustomer) queueUpsert("customers", updatedCustomer);
@@ -1233,21 +1504,23 @@ function ReturnModal({ sale, alreadyReturned, onClose, onDone, db, setDb, showTo
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
         {sale.items.map(it => {
+          const key = lineKey(it);
           const max = maxFor(it);
+          const label = it.size ? `${it.name} — ${it.size}` : it.name;
           if (max <= 0) return (
-            <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10, opacity: 0.5 }}>
-              <div style={{ flex: 1, fontSize: 13, color: W.muted }}>{it.name} — fully returned</div>
+            <div key={key} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10, opacity: 0.5 }}>
+              <div style={{ flex: 1, fontSize: 13, color: W.muted }}>{label} — fully returned</div>
             </div>
           );
           return (
-            <div key={it.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10 }}>
+            <div key={key} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: W.blush, borderRadius: 10 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13.5, fontWeight: 600, color: W.ink }}>{it.name}</div>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: W.ink }}>{label}</div>
                 <div style={{ fontSize: 11, color: W.muted }}>{GHS(it.price)} each · {max} returnable</div>
               </div>
-              <button onClick={() => setQty(it.id, qtys[it.id] - 1, max)} style={qtyBtn}>−</button>
-              <span style={{ fontSize: 14, fontWeight: 700, minWidth: 20, textAlign: "center" }}>{qtys[it.id]}</span>
-              <button onClick={() => setQty(it.id, qtys[it.id] + 1, max)} style={qtyBtn}>+</button>
+              <button onClick={() => setQty(key, qtys[key] - 1, max)} style={qtyBtn}>−</button>
+              <span style={{ fontSize: 14, fontWeight: 700, minWidth: 20, textAlign: "center" }}>{qtys[key]}</span>
+              <button onClick={() => setQty(key, qtys[key] + 1, max)} style={qtyBtn}>+</button>
             </div>
           );
         })}
