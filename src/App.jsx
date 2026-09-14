@@ -314,18 +314,34 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [syncStatus, setSyncStatus] = useState({ state: "idle", pending: pendingCount() });
 
+  // Tracks whether a local write (sale, edit, etc.) has landed since a given
+  // cloud pull started. A pull's SELECT can be in flight when the user makes
+  // a sale locally; if it resolves afterwards with its older snapshot, it
+  // must not be allowed to stomp the newer local write. Each refresh() call
+  // captures the counter's value when it starts and only applies its result
+  // if nothing local has changed since.
+  const localWriteCountRef = useRef(0);
+
   // Pull latest cloud state on load (and whenever coming back online), so any
   // device sees every other device's changes after a refresh.
   useEffect(() => {
     let cancelled = false;
     const refresh = async () => {
       if (typeof navigator !== "undefined" && !navigator.onLine) return;
+      const writeCountAtStart = localWriteCountRef.current;
       setSyncStatus(s => ({ ...s, state: "syncing" }));
       try {
         const cloud = await pullAll();
         if (!cancelled) {
-          setDbState(cloud);
-          saveCache(cloud);
+          if (localWriteCountRef.current === writeCountAtStart) {
+            // No local writes happened while this pull was in flight — safe to apply.
+            setDbState(cloud);
+            saveCache(cloud);
+          }
+          // Otherwise a sale/edit landed locally during this pull; skip applying
+          // this stale snapshot. The outbox drain will push the local write to
+          // the cloud, and the next refresh (reload / reconnect) will pick up
+          // the fully-merged state.
           setSyncStatus({ state: "synced", pending: pendingCount(), at: Date.now() });
         }
       } catch (e) {
@@ -341,6 +357,7 @@ export default function App() {
 
   // setDb: updates local state + cache instantly (works offline), UI never waits on network.
   const setDb = (updater) => {
+    localWriteCountRef.current += 1;
     setDbState(prev => {
       const next = typeof updater === "function" ? updater(prev) : updater;
       saveCache(next);
@@ -349,11 +366,14 @@ export default function App() {
   };
 
   const manualRefresh = async () => {
+    const writeCountAtStart = localWriteCountRef.current;
     setSyncStatus(s => ({ ...s, state: "syncing" }));
     try {
       const cloud = await pullAll();
-      setDbState(cloud);
-      saveCache(cloud);
+      if (localWriteCountRef.current === writeCountAtStart) {
+        setDbState(cloud);
+        saveCache(cloud);
+      }
       setSyncStatus({ state: "synced", pending: pendingCount(), at: Date.now() });
     } catch (e) {
       setSyncStatus(s => ({ ...s, state: "error", error: e.message }));
