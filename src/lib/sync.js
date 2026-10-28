@@ -57,17 +57,24 @@ const fromAuditRow = (r) => ({ id: r.id, at: r.at, actor: r.actor, role: r.role,
 const toReturnRow = (rt) => ({ id: rt.id, shop_id: SHOP_ID, sale_id: rt.saleId, date: rt.date, items: rt.items, refund_total: rt.refundTotal, reason: rt.reason, processed_by: rt.processedBy });
 const fromReturnRow = (r) => ({ id: r.id, saleId: r.sale_id, date: r.date, items: r.items, refundTotal: r.refund_total, reason: r.reason, processedBy: r.processed_by });
 
+const toExpenseRow = (e) => ({ id: e.id, shop_id: SHOP_ID, date: e.date, amount: e.amount, category: e.category, note: e.note || "", created_by: e.createdBy || "", updated_at: new Date().toISOString() });
+const fromExpenseRow = (r) => ({ id: r.id, date: r.date, amount: Number(r.amount) || 0, category: r.category, note: r.note || "", createdBy: r.created_by || "" });
+
 // ── Pull full state from cloud (used on load / manual refresh) ──────────────
 export async function pullAll() {
-  const [products, sales, customers, staff, settingsRes, returns] = await Promise.all([
+  const [products, sales, customers, staff, settingsRes, returns, expensesRes] = await Promise.all([
     supabase.from("tws_products").select("*").eq("shop_id", SHOP_ID),
     supabase.from("tws_sales").select("*").eq("shop_id", SHOP_ID).order("date", { ascending: false }),
     supabase.from("tws_customers").select("*").eq("shop_id", SHOP_ID),
     supabase.from("tws_staff").select("*").eq("shop_id", SHOP_ID),
     supabase.from("tws_settings").select("*").eq("shop_id", SHOP_ID).maybeSingle(),
     supabase.from("tws_returns").select("*").eq("shop_id", SHOP_ID).order("date", { ascending: false }),
+    supabase.from("tws_expenses").select("*").eq("shop_id", SHOP_ID).order("date", { ascending: false }),
   ]);
 
+  // Expenses are deliberately NOT in the fatal-error list: if the tws_expenses
+  // table hasn't been created in Supabase yet, the rest of the app must keep
+  // working. In that case we keep whatever expenses are cached on this device.
   const errors = [products.error, sales.error, customers.error, staff.error, settingsRes.error, returns.error].filter(Boolean);
   if (errors.length) throw errors[0];
 
@@ -78,6 +85,7 @@ export async function pullAll() {
     staff: (staff.data || []).map(fromStaffRow),
     settings: settingsRes.data ? fromSettingsRow(settingsRes.data) : { shopName: "The Wardrobe Selection", location: "Accra, Ghana", phone: "0597147460", lowStockAlerts: true, customCategories: [] },
     returns: (returns.data || []).map(fromReturnRow),
+    expenses: expensesRes.error ? (loadCache()?.expenses || []) : (expensesRes.data || []).map(fromExpenseRow),
   };
 }
 
@@ -91,6 +99,7 @@ export function queueUpsert(table, appRow) {
     settings:  toSettingsRow,
     audit:     toAuditRow,
     returns:   toReturnRow,
+    expenses:  toExpenseRow,
   }[table](appRow);
   enqueue({ type: "upsert", table, row: mapped });
   drainOutbox();
@@ -102,7 +111,7 @@ export function queueDelete(table, id) {
 }
 
 // ── Table name mapping (app table -> supabase table) ─────────────────────────
-const SB_TABLE = { products: "tws_products", sales: "tws_sales", customers: "tws_customers", staff: "tws_staff", settings: "tws_settings", audit: "tws_audit", returns: "tws_returns" };
+const SB_TABLE = { products: "tws_products", sales: "tws_sales", customers: "tws_customers", staff: "tws_staff", settings: "tws_settings", audit: "tws_audit", returns: "tws_returns", expenses: "tws_expenses" };
 
 // ── Audit trail ───────────────────────────────────────────────────────────────
 // Fire-and-forget: queues an entry the same way as any other write, so it's
@@ -129,6 +138,11 @@ export async function drainOutbox(onStatusChange) {
   if (draining) return;
   if (typeof navigator !== "undefined" && !navigator.onLine) return;
   draining = true;
+  // Ops skipped during THIS drain because their table doesn't exist yet. They
+  // stay in the outbox and are retried next time; they must never block the
+  // sales/stock writes queued behind them.
+  const skipped = new Set();
+  const isMissingTable = (e) => e && (e.code === "PGRST205" || e.code === "42P01" || /does not exist|schema cache|Could not find the table/i.test(e.message || ""));
   try {
     while (true) {
       // Re-read fresh on every iteration — items can be enqueued by other
@@ -137,7 +151,8 @@ export async function drainOutbox(onStatusChange) {
       // doesn't include them (that would silently drop those entries).
       const q = loadOutbox();
       if (q.length === 0) break;
-      const op = q[0];
+      const op = q.find(x => !skipped.has(x.opId));
+      if (!op) break;
       const sbTable = SB_TABLE[op.table];
       try {
         if (op.type === "upsert") {
@@ -156,6 +171,11 @@ export async function drainOutbox(onStatusChange) {
         saveOutbox(next);
         onStatusChange?.({ pending: next.length, ok: true });
       } catch (e) {
+        if (op.table === "expenses" && isMissingTable(e)) {
+          skipped.add(op.opId);
+          onStatusChange?.({ pending: q.length, ok: false, error: "Expenses table not created in Supabase yet" });
+          continue;
+        }
         // Network or server error — stop draining, retry later
         onStatusChange?.({ pending: q.length, ok: false, error: e.message });
         break;
@@ -174,6 +194,7 @@ export async function clearCloud() {
     supabase.from("tws_customers").delete().eq("shop_id", SHOP_ID),
     supabase.from("tws_staff").delete().eq("shop_id", SHOP_ID),
     supabase.from("tws_returns").delete().eq("shop_id", SHOP_ID),
+    supabase.from("tws_expenses").delete().eq("shop_id", SHOP_ID),
   ]);
 }
 

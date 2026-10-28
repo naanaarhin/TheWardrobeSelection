@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { loadCache, saveCache, pullAll, queueUpsert, queueDelete, drainOutbox, pendingCount, clearCloud, logAudit, pullAuditLog } from "./lib/sync.js";
+import { periodRange, inRange, expenseDay, expensesInRange, sumAmounts, grossProfitFor, expensesByCategory, makeBuckets, localTodayISO } from "./lib/finance.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THE WARDROBE SELECTION — Premium Boutique Manager (single-user edition)
@@ -39,6 +40,8 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const nowStamp = () => new Date().toISOString();
 
+const EXPENSE_CATEGORIES = ["Rent", "Wages", "Transport", "Utilities", "Packaging", "Marketing", "Repairs", "Supplies", "Taxes & Levies", "Other"];
+
 const CATEGORIES = ["Dresses", "Tops", "Bottoms", "Footwear", "Bags", "Accessories", "Jewellery", "Fragrance", "Other"];
 
 // ── Seed data ────────────────────────────────────────────────────────────────
@@ -74,26 +77,7 @@ function loadData() {
 }
 
 // ── Period helpers for financial reports ─────────────────────────────────────
-function periodRange(period, custom) {
-  const now = new Date();
-  const end = new Date(now); end.setHours(23,59,59,999);
-  let start = new Date(now); start.setHours(0,0,0,0);
-  if (period === "daily")   { /* today */ }
-  else if (period === "weekly")  { start.setDate(start.getDate() - 6); }
-  else if (period === "monthly") { start.setDate(1); }
-  else if (period === "yearly")  { start.setMonth(0, 1); }
-  else if (period === "custom" && custom?.from && custom?.to) {
-    start = new Date(custom.from); start.setHours(0,0,0,0);
-    const e = new Date(custom.to); e.setHours(23,59,59,999);
-    return { start, end: e };
-  }
-  return { start, end };
-}
-
-function inRange(iso, range) {
-  const d = new Date(iso);
-  return d >= range.start && d <= range.end;
-}
+// periodRange / inRange live in ./lib/finance.js (shared + unit-tested)
 
 // ── Tiny UI atoms ────────────────────────────────────────────────────────────
 function Pill({ children, bg, color }) {
@@ -262,13 +246,15 @@ function LoginScreen({ staff, onLogin }) {
 
 // ── MINI BAR CHART (no library) ──────────────────────────────────────────────
 function BarChart({ data, height = 140, color = W.wine }) {
-  const max = Math.max(...data.map(d => d.value), 1);
+  // Bars grow from the baseline by size; a negative value (a loss) is drawn red with a minus sign.
+  const max = Math.max(...data.map(d => Math.abs(d.value)), 1);
+  const fmt = (v) => { const a = Math.abs(v); return (v < 0 ? "-" : "") + (a >= 1000 ? (a/1000).toFixed(1)+"k" : Math.round(a)); };
   return (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height, padding: "0 4px" }}>
       {data.map((d, i) => (
         <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6, height: "100%", justifyContent: "flex-end" }}>
-          <div style={{ fontSize: 10, color: W.muted, fontWeight: 600 }}>{d.value > 0 ? (d.value >= 1000 ? (d.value/1000).toFixed(1)+"k" : Math.round(d.value)) : ""}</div>
-          <div style={{ width: "100%", maxWidth: 40, height: `${(d.value/max)*100}%`, minHeight: d.value > 0 ? 4 : 0, background: `linear-gradient(180deg, ${W.accent}, ${color})`, borderRadius: "6px 6px 0 0", transition: "height 0.4s ease" }} />
+          <div style={{ fontSize: 10, color: d.value < 0 ? W.red : W.muted, fontWeight: 600 }}>{d.value !== 0 ? fmt(d.value) : ""}</div>
+          <div style={{ width: "100%", maxWidth: 40, height: `${(Math.abs(d.value)/max)*100}%`, minHeight: d.value !== 0 ? 4 : 0, background: d.value < 0 ? `linear-gradient(180deg, #e06b6b, ${W.red})` : `linear-gradient(180deg, ${W.accent}, ${color})`, borderRadius: "6px 6px 0 0", transition: "height 0.4s ease" }} />
           <div style={{ fontSize: 10, color: W.muted, textAlign: "center", lineHeight: 1.1 }}>{d.label}</div>
         </div>
       ))}
@@ -418,6 +404,7 @@ export default function App() {
     { id: "sales",     label: "Sales",     icon: "🧾" },
     { id: "customers", label: "Clients",   icon: "♛" },
     { id: "reports",   label: "Reports",   icon: "▨" },
+    { id: "expenses",  label: "Expenses",  icon: "₵" },
     { id: "settings",  label: "Settings",  icon: "⚙" },
   ] : [
     { id: "sell", label: "New Sale", icon: "✚" },
@@ -448,6 +435,7 @@ export default function App() {
         {tab === "sales"     && isAdmin && <SalesHistory db={db} setDb={setDb} showToast={showToast} session={session} />}
         {tab === "customers" && isAdmin && <Customers db={db} setDb={setDb} showToast={showToast} session={session} />}
         {tab === "reports"   && isAdmin && <Reports db={db} />}
+        {tab === "expenses"  && isAdmin && <Expenses db={db} setDb={setDb} showToast={showToast} session={session} />}
         {tab === "settings"  && isAdmin && <Settings db={db} setDb={setDb} showToast={showToast} onLogout={logout} session={session} />}
       </main>
 
@@ -456,11 +444,11 @@ export default function App() {
         {navItems.map(n => (
           <button key={n.id} onClick={() => setTab(n.id)} style={{
             background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column",
-            alignItems: "center", gap: 3, padding: "4px 6px", fontFamily: "inherit",
+            alignItems: "center", gap: 3, padding: "4px 2px", fontFamily: "inherit",
             color: tab === n.id ? W.wine : W.muted, flex: 1, minWidth: 0,
           }}>
             <span style={{ fontSize: 17, lineHeight: 1, filter: tab === n.id ? "none" : "grayscale(0.4)" }}>{n.icon}</span>
-            <span style={{ fontSize: 9.5, fontWeight: tab === n.id ? 700 : 500, whiteSpace: "nowrap" }}>{n.label}</span>
+            <span style={{ fontSize: navItems.length > 7 ? 8.5 : 9.5, fontWeight: tab === n.id ? 700 : 500, whiteSpace: "nowrap" }}>{n.label}</span>
             {tab === n.id && <span style={{ width: 4, height: 4, borderRadius: "50%", background: W.gold }} />}
           </button>
         ))}
@@ -1629,15 +1617,240 @@ function Customers({ db, setDb, showToast, session }) {
   );
 }
 
+// ── SHARED PERIOD PICKER (Today / Week / Month / Year / Custom) ──────────────
+const PERIOD_TABS = [
+  { id: "daily",   label: "Today" },
+  { id: "weekly",  label: "Week" },
+  { id: "monthly", label: "Month" },
+  { id: "yearly",  label: "Year" },
+  { id: "custom",  label: "Custom" },
+];
+
+function rangeLabelFor(period, range) {
+  if (period === "daily") return new Date().toLocaleDateString("en-GH", { dateStyle: "full" });
+  const f = (d) => d.toLocaleDateString("en-GH", { day: "numeric", month: "short", year: "numeric" });
+  return `${f(range.start)} — ${f(range.end)}`;
+}
+
+function PeriodPicker({ period, setPeriod, custom, setCustom }) {
+  return (
+    <>
+      <div style={{ display: "flex", gap: 7, marginBottom: 14, background: "#fff", padding: 6, borderRadius: 14, border: `1px solid ${W.border}` }}>
+        {PERIOD_TABS.map(p => (
+          <button key={p.id} onClick={() => setPeriod(p.id)} style={{
+            flex: 1, padding: "9px 0", borderRadius: 9, fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", border: "none",
+            background: period === p.id ? `linear-gradient(135deg, ${W.wine}, ${W.wineDk})` : "transparent",
+            color: period === p.id ? "#fff" : W.muted,
+          }}>{p.label}</button>
+        ))}
+      </div>
+      {period === "custom" && (
+        <div style={{ display: "flex", gap: 10, marginBottom: 14, background: "#fff", padding: 14, borderRadius: 14, border: `1px solid ${W.border}` }}>
+          <div style={{ flex: 1 }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: W.wine, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 5 }}>From</span>
+            <input type="date" value={custom.from} onChange={e => setCustom(c => ({ ...c, from: e.target.value }))} style={inputStyle} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: W.wine, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 5 }}>To</span>
+            <input type="date" value={custom.to} onChange={e => setCustom(c => ({ ...c, to: e.target.value }))} style={inputStyle} />
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── EXPENSES ─────────────────────────────────────────────────────────────────
+function Expenses({ db, setDb, showToast, session }) {
+  const expenses = db.expenses || [];
+  const sales = db.sales || [];
+  const returns = db.returns || [];
+
+  const [period, setPeriod] = useState("monthly");
+  const [custom, setCustom] = useState({ from: localTodayISO(), to: localTodayISO() });
+  const [showModal, setShowModal] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const blank = () => ({ date: localTodayISO(), amount: "", category: EXPENSE_CATEGORIES[0], note: "" });
+  const [form, setForm] = useState(blank());
+
+  const range = useMemo(() => periodRange(period, custom), [period, custom]);
+  const list = useMemo(() => expensesInRange(expenses, range)
+    .sort((a, b) => (b.date || "").localeCompare(a.date || "") || (b.id || "").localeCompare(a.id || "")), [expenses, range]);
+  const total = useMemo(() => sumAmounts(list), [list]);
+  const byCat = useMemo(() => expensesByCategory(list), [list]);
+  const gross = useMemo(() => grossProfitFor(sales, returns, range), [sales, returns, range]);
+  const net = gross - total;
+
+  const trend = useMemo(() => {
+    const { labels, indexOf } = makeBuckets(period, range);
+    const vals = labels.map(() => 0);
+    list.forEach(e => { const i = indexOf(expenseDay(e.date)); if (i >= 0) vals[i] += Number(e.amount) || 0; });
+    return labels.map((label, i) => ({ label, value: vals[i] }));
+  }, [period, range, list]);
+
+  const openAdd = () => { setForm(blank()); setEditing(null); setConfirmDel(false); setShowModal(true); };
+  const openEdit = (e) => { setForm({ date: e.date, amount: String(e.amount), category: e.category, note: e.note || "", createdBy: e.createdBy }); setEditing(e.id); setConfirmDel(false); setShowModal(true); };
+
+  const save = () => {
+    const amount = Math.round(parseFloat(form.amount) * 100) / 100;
+    if (!(amount > 0) || !isFinite(amount)) { showToast("Enter an amount greater than 0", "err"); return; }
+    if (!form.date) { showToast("Pick a date", "err"); return; }
+    const exp = { id: editing || uid(), date: form.date, amount, category: form.category, note: (form.note || "").trim(), createdBy: editing ? (form.createdBy || session?.name) : session?.name };
+    setDb(prev => {
+      const cur = prev.expenses || [];
+      return { ...prev, expenses: editing ? cur.map(x => x.id === editing ? exp : x) : [exp, ...cur] };
+    });
+    queueUpsert("expenses", exp);
+    logAudit({ actor: session?.name, role: session?.role, action: editing ? "updated" : "created", entity: "expense", entityId: exp.id, summary: `${editing ? "Updated" : "Added"} expense ${GHS(exp.amount)} — ${exp.category}${exp.note ? ` (${exp.note})` : ""} on ${exp.date}` });
+    setShowModal(false); showToast(editing ? "Expense updated" : "Expense added");
+  };
+
+  const remove = () => {
+    const e = expenses.find(x => x.id === editing);
+    setDb(prev => ({ ...prev, expenses: (prev.expenses || []).filter(x => x.id !== editing) }));
+    queueDelete("expenses", editing);
+    logAudit({ actor: session?.name, role: session?.role, action: "deleted", entity: "expense", entityId: editing, summary: `Deleted expense ${GHS(e?.amount)} — ${e?.category || ""} on ${e?.date || ""}` });
+    setShowModal(false); showToast("Expense deleted");
+  };
+
+  const exportCSV = () => {
+    const rows = [
+      ["The Wardrobe Selection — Expenses"],
+      ["Period", period, rangeLabelFor(period, range)],
+      [],
+      ["Date", "Category", "Note", "Amount", "Recorded by"],
+      ...list.map(e => [e.date, e.category, e.note || "", Number(e.amount).toFixed(2), e.createdBy || ""]),
+      [],
+      ["Total Expenses", "", "", total.toFixed(2)],
+      ["Gross Profit", "", "", gross.toFixed(2)],
+      ["Net Profit", "", "", net.toFixed(2)],
+      [],
+      ["Category", "Amount"],
+      ...byCat.map(([k, v]) => [k, v.toFixed(2)]),
+    ];
+    const csv = rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+    a.download = `TWS-expenses-${period}-${localTodayISO()}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+
+  const Mini = ({ label, value, accent }) => (
+    <div style={{ background: "#fff", borderRadius: 14, padding: "14px 16px", border: `1px solid ${W.border}`, position: "relative", overflow: "hidden" }}>
+      <div style={{ position: "absolute", top: 0, left: 0, width: 4, height: "100%", background: accent || W.wine }} />
+      <div style={{ fontSize: 11, color: W.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 19, fontWeight: 800, color: W.ink, fontFamily: "'Playfair Display', serif", lineHeight: 1 }}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div>
+      <SectionTitle title="Expenses" subtitle={rangeLabelFor(period, range)} action={<div style={{ display: "flex", gap: 8 }}><Btn kind="ghost" small onClick={exportCSV}>↓ Export</Btn><Btn onClick={openAdd} small>✚ Add</Btn></div>} />
+
+      <PeriodPicker period={period} setPeriod={setPeriod} custom={custom} setCustom={setCustom} />
+
+      {/* Hero total */}
+      <div style={{ background: `linear-gradient(135deg, ${W.wine}, ${W.wineDk})`, borderRadius: 18, padding: "22px 24px", color: "#fff", marginBottom: 14, position: "relative", overflow: "hidden" }}>
+        <div style={{ position: "absolute", right: -30, top: -30, width: 150, height: 150, borderRadius: "50%", background: "rgba(201,162,76,0.12)" }} />
+        <div style={{ fontSize: 12, color: W.rose, letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>Total expenses</div>
+        <div style={{ fontSize: 36, fontWeight: 800, fontFamily: "'Playfair Display', serif", lineHeight: 1 }}>{GHS(total)}</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "14px 22px", marginTop: 16 }}>
+          <div><div style={{ fontSize: 17, fontWeight: 700 }}>{list.length}</div><div style={{ fontSize: 11, color: W.rose }}>Entries</div></div>
+          <div><div style={{ fontSize: 17, fontWeight: 700 }}>{byCat[0] ? byCat[0][0] : "—"}</div><div style={{ fontSize: 11, color: W.rose }}>Biggest category</div></div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 16 }}>
+        <Mini label="Gross Profit" value={GHS(gross)} accent={W.green} />
+        <Mini label="Net Profit" value={GHS(net)} accent={net < 0 ? W.red : W.green} />
+      </div>
+
+      {/* Trend (not useful for a single day) */}
+      {period !== "daily" && (
+        <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}`, marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, marginBottom: 14 }}>Expense Trend</div>
+          <BarChart data={trend} height={150} />
+        </div>
+      )}
+
+      {/* Category breakdown */}
+      {byCat.length > 0 && (
+        <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}`, marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, marginBottom: 14 }}>By Category</div>
+          {byCat.map(([cat, amt]) => {
+            const pct = total ? (amt / total) * 100 : 0;
+            return (
+              <div key={cat} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 5 }}>
+                  <span style={{ color: W.ink, fontWeight: 600 }}>{cat}</span>
+                  <span style={{ color: W.wine, fontWeight: 700 }}>{GHS(amt)} · {pct.toFixed(0)}%</span>
+                </div>
+                <div style={{ height: 7, background: W.blush, borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ width: `${pct}%`, height: "100%", background: `linear-gradient(90deg, ${W.accent}, ${W.wine})`, borderRadius: 4 }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Entries */}
+      <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, margin: "4px 2px 10px" }}>Entries</div>
+      {list.length === 0 && <div style={{ textAlign: "center", color: W.muted, padding: 32, fontSize: 14, background: "#fff", borderRadius: 14, border: `1px solid ${W.border}` }}>No expenses in this period.</div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {list.map(e => (
+          <div key={e.id} onClick={() => openEdit(e)} style={{ background: "#fff", borderRadius: 14, padding: "13px 16px", border: `1px solid ${W.border}`, cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                <Pill bg={W.blush} color={W.wine}>{e.category}</Pill>
+                <span style={{ fontSize: 11.5, color: W.muted }}>{expenseDay(e.date).toLocaleDateString("en-GH", { day: "numeric", month: "short", year: "numeric" })}</span>
+              </div>
+              <div style={{ fontSize: 13, color: W.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.note || <span style={{ color: W.muted }}>No note</span>}</div>
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 800, color: W.red, fontFamily: "'Playfair Display', serif", flexShrink: 0 }}>{GHS(e.amount)}</div>
+          </div>
+        ))}
+      </div>
+
+      {showModal && (
+        <Modal title={editing ? "Edit Expense" : "Add Expense"} subtitle="Shop running costs — not stock purchases" onClose={() => setShowModal(false)}>
+          <Field label="Amount (GH₵)"><input style={inputStyle} type="number" inputMode="decimal" min="0" step="0.01" value={form.amount} onChange={e => setForm(f => ({ ...f, amount: e.target.value }))} placeholder="0.00" autoFocus /></Field>
+          <Field label="Category">
+            <select style={inputStyle} value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}>
+              {EXPENSE_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </Field>
+          <Field label="Date"><input style={inputStyle} type="date" value={form.date} onChange={e => setForm(f => ({ ...f, date: e.target.value }))} /></Field>
+          <Field label="Note (optional)"><input style={inputStyle} value={form.note} onChange={e => setForm(f => ({ ...f, note: e.target.value }))} placeholder="e.g. Shop rent for November" /></Field>
+          <div style={{ background: W.amberBg, color: W.amber, borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 12, lineHeight: 1.5 }}>
+            Don't add stock purchases here. The cost of goods is already counted in your sales profit, so adding it again would count it twice.
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+            {editing && (confirmDel
+              ? <Btn kind="danger" small onClick={remove}>Confirm delete</Btn>
+              : <Btn kind="ghost" small onClick={() => setConfirmDel(true)} style={{ color: W.red }}>Delete</Btn>)}
+            <div style={{ flex: 1 }} />
+            <Btn kind="ghost" onClick={() => setShowModal(false)}>Cancel</Btn>
+            <Btn onClick={save}>{editing ? "Save" : "Add"}</Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 // ── REPORTS (the signature feature) ──────────────────────────────────────────
 function Reports({ db }) {
-  const { sales, products, expenses, returns = [] } = db;
+  const { sales, products, expenses = [], returns = [] } = db;
   const [period, setPeriod] = useState("daily");
   const [custom, setCustom] = useState({ from: todayISO(), to: todayISO() });
+  const [trendMetric, setTrendMetric] = useState("revenue"); // revenue | profit | net
 
   const range = useMemo(() => periodRange(period, custom), [period, custom]);
   const periodSales = useMemo(() => sales.filter(s => inRange(s.date, range)), [sales, range]);
   const periodReturns = useMemo(() => returns.filter(r => inRange(r.date, range)), [returns, range]);
+  const periodExpenses = useMemo(() => expensesInRange(expenses, range), [expenses, range]);
 
   const report = useMemo(() => {
     const grossRevenue = periodSales.reduce((a, s) => a + s.total, 0);
@@ -1652,6 +1865,9 @@ function Reports({ db }) {
     const avgOrder = orders ? grossRevenue / orders : 0;
     const cost = revenue - profit;
     const margin = revenue ? (profit / revenue) * 100 : 0;
+    const expensesTotal = sumAmounts(periodExpenses);
+    const netProfit = profit - expensesTotal;
+    const expenseByCat = expensesByCategory(periodExpenses);
 
     // Payment breakdown
     const payMap = {};
@@ -1670,63 +1886,25 @@ function Reports({ db }) {
     }));
     const topProducts = Object.entries(prodMap).sort((a, b) => b[1].rev - a[1].rev).slice(0, 6);
 
-    return { revenue, profit, discount, units, orders, avgOrder, cost, margin, payMap, channelMap, topProducts, refunds, grossRevenue, returnCount: periodReturns.length };
-  }, [periodSales, periodReturns]);
+    return { revenue, profit, discount, units, orders, avgOrder, cost, margin, payMap, channelMap, topProducts, refunds, grossRevenue, returnCount: periodReturns.length, expensesTotal, netProfit, expenseByCat };
+  }, [periodSales, periodReturns, periodExpenses]);
 
-  // Trend chart data based on period
+  // Trend chart: revenue, profit (after returns) or net profit (after expenses) per bucket.
+  // Expenses are dated by day only, so "net" isn't available for the hourly Today view.
+  const metric = period === "daily" && trendMetric === "net" ? "profit" : trendMetric;
   const trend = useMemo(() => {
-    const out = [];
-    if (period === "daily") {
-      // hourly buckets (business hours 8-20)
-      for (let h = 8; h <= 20; h += 2) {
-        const rev = periodSales.filter(s => { const hr = new Date(s.date).getHours(); return hr >= h && hr < h+2; }).reduce((a,s)=>a+s.total,0);
-        out.push({ label: `${h}h`, value: rev });
-      }
-    } else if (period === "weekly") {
-      for (let i = 6; i >= 0; i--) {
-        const d = new Date(); d.setDate(d.getDate() - i); const iso = d.toISOString().slice(0,10);
-        out.push({ label: d.toLocaleDateString("en-GH",{weekday:"short"}).slice(0,2), value: sales.filter(s=>s.date?.slice(0,10)===iso).reduce((a,s)=>a+s.total,0) });
-      }
-    } else if (period === "monthly") {
-      const now = new Date(); const days = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
-      const weeks = [0,0,0,0,0];
-      periodSales.forEach(s => { const day = new Date(s.date).getDate(); const w = Math.min(4, Math.floor((day-1)/7)); weeks[w] += s.total; });
-      weeks.forEach((v, i) => out.push({ label: `W${i+1}`, value: v }));
-    } else if (period === "yearly") {
-      const months = Array(12).fill(0);
-      periodSales.forEach(s => { months[new Date(s.date).getMonth()] += s.total; });
-      const names = ["J","F","M","A","M","J","J","A","S","O","N","D"];
-      months.forEach((v, i) => out.push({ label: names[i], value: v }));
-    } else {
-      // custom - group by day if range small, else by month
-      const dayMs = 86400000; const span = (range.end - range.start) / dayMs;
-      if (span <= 31) {
-        const map = {};
-        periodSales.forEach(s => { const k = s.date.slice(0,10); map[k] = (map[k]||0) + s.total; });
-        Object.entries(map).sort().forEach(([k,v]) => out.push({ label: k.slice(8), value: v }));
-        if (out.length === 0) out.push({ label: "—", value: 0 });
-      } else {
-        const map = {};
-        periodSales.forEach(s => { const k = s.date.slice(0,7); map[k] = (map[k]||0) + s.total; });
-        Object.entries(map).sort().forEach(([k,v]) => out.push({ label: k.slice(5), value: v }));
-        if (out.length === 0) out.push({ label: "—", value: 0 });
-      }
+    const { labels, indexOf } = makeBuckets(period, range);
+    const vals = labels.map(() => 0);
+    const add = (d, v) => { const i = indexOf(d); if (i >= 0) vals[i] += v; };
+    periodSales.forEach(s => add(new Date(s.date), metric === "revenue" ? s.total : (s.profit || 0)));
+    if (metric !== "revenue") {
+      periodReturns.forEach(r => add(new Date(r.date), -r.items.reduce((x, it) => x + (it.price - it.cost) * it.qty, 0)));
     }
-    return out;
-  }, [period, periodSales, sales, range]);
+    if (metric === "net") periodExpenses.forEach(e => add(expenseDay(e.date), -(Number(e.amount) || 0)));
+    return labels.map((label, i) => ({ label, value: vals[i] }));
+  }, [period, range, metric, periodSales, periodReturns, periodExpenses]);
 
-  const periods = [
-    { id: "daily",   label: "Today" },
-    { id: "weekly",  label: "Week" },
-    { id: "monthly", label: "Month" },
-    { id: "yearly",  label: "Year" },
-    { id: "custom",  label: "Custom" },
-  ];
-
-  const rangeLabel = () => {
-    if (period === "daily") return new Date().toLocaleDateString("en-GH", { dateStyle: "full" });
-    return `${range.start.toLocaleDateString("en-GH", { day:"numeric", month:"short", year:"numeric" })} — ${range.end.toLocaleDateString("en-GH", { day:"numeric", month:"short", year:"numeric" })}`;
-  };
+  const rangeLabel = () => rangeLabelFor(period, range);
 
   const exportCSV = () => {
     const rows = [
@@ -1736,8 +1914,10 @@ function Reports({ db }) {
       ["Metric", "Value"],
       ["Revenue", report.revenue.toFixed(2)],
       ["Cost of Goods", report.cost.toFixed(2)],
-      ["Profit", report.profit.toFixed(2)],
-      ["Margin %", report.margin.toFixed(1)],
+      ["Gross Profit", report.profit.toFixed(2)],
+      ["Expenses", report.expensesTotal.toFixed(2)],
+      ["Net Profit", report.netProfit.toFixed(2)],
+      ["Margin % (gross)", report.margin.toFixed(1)],
       ["Discounts Given", report.discount.toFixed(2)],
       ["Orders", report.orders],
       ["Units Sold", report.units],
@@ -1748,6 +1928,9 @@ function Reports({ db }) {
       [],
       ["Payment Method", "Amount"],
       ...Object.entries(report.payMap).map(([k, v]) => [k, v.toFixed(2)]),
+      [],
+      ["Expense Category", "Amount"],
+      ...report.expenseByCat.map(([k, v]) => [k, v.toFixed(2)]),
     ];
     const csv = rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
     const a = document.createElement("a");
@@ -1768,38 +1951,17 @@ function Reports({ db }) {
     <div>
       <SectionTitle title="Financial Reports" subtitle={rangeLabel()} action={<Btn kind="gold" small onClick={exportCSV}>↓ Export</Btn>} />
 
-      {/* Period selector */}
-      <div style={{ display: "flex", gap: 7, marginBottom: 14, background: "#fff", padding: 6, borderRadius: 14, border: `1px solid ${W.border}` }}>
-        {periods.map(p => (
-          <button key={p.id} onClick={() => setPeriod(p.id)} style={{
-            flex: 1, padding: "9px 0", borderRadius: 9, fontSize: 12.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", border: "none",
-            background: period === p.id ? `linear-gradient(135deg, ${W.wine}, ${W.wineDk})` : "transparent",
-            color: period === p.id ? "#fff" : W.muted,
-          }}>{p.label}</button>
-        ))}
-      </div>
-
-      {/* Custom range picker */}
-      {period === "custom" && (
-        <div style={{ display: "flex", gap: 10, marginBottom: 14, background: "#fff", padding: 14, borderRadius: 14, border: `1px solid ${W.border}` }}>
-          <div style={{ flex: 1 }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: W.wine, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 5 }}>From</span>
-            <input type="date" value={custom.from} onChange={e => setCustom(c => ({ ...c, from: e.target.value }))} style={inputStyle} />
-          </div>
-          <div style={{ flex: 1 }}>
-            <span style={{ fontSize: 11, fontWeight: 700, color: W.wine, textTransform: "uppercase", letterSpacing: 0.5, display: "block", marginBottom: 5 }}>To</span>
-            <input type="date" value={custom.to} onChange={e => setCustom(c => ({ ...c, to: e.target.value }))} style={inputStyle} />
-          </div>
-        </div>
-      )}
+      <PeriodPicker period={period} setPeriod={setPeriod} custom={custom} setCustom={setCustom} />
 
       {/* Hero revenue */}
       <div style={{ background: `linear-gradient(135deg, ${W.wine}, ${W.wineDk})`, borderRadius: 18, padding: "22px 24px", color: "#fff", marginBottom: 14, position: "relative", overflow: "hidden" }}>
         <div style={{ position: "absolute", right: -30, top: -30, width: 150, height: 150, borderRadius: "50%", background: "rgba(201,162,76,0.12)" }} />
         <div style={{ fontSize: 12, color: W.rose, letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>{report.refunds > 0 ? "Net Revenue (after refunds)" : "Revenue this period"}</div>
         <div style={{ fontSize: 36, fontWeight: 800, fontFamily: "'Playfair Display', serif", lineHeight: 1 }}>{GHS(report.revenue)}</div>
-        <div style={{ display: "flex", gap: 22, marginTop: 16 }}>
-          <div><div style={{ fontSize: 17, fontWeight: 700 }}>{GHS(report.profit)}</div><div style={{ fontSize: 11, color: W.rose }}>Profit ({report.margin.toFixed(0)}%)</div></div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "14px 22px", marginTop: 16 }}>
+          <div><div style={{ fontSize: 17, fontWeight: 700 }}>{GHS(report.profit)}</div><div style={{ fontSize: 11, color: W.rose }}>Gross profit ({report.margin.toFixed(0)}%)</div></div>
+          <div><div style={{ fontSize: 17, fontWeight: 700 }}>{GHS(report.expensesTotal)}</div><div style={{ fontSize: 11, color: W.rose }}>Expenses</div></div>
+          <div><div style={{ fontSize: 17, fontWeight: 700, color: report.netProfit < 0 ? "#ffb3b3" : "#fff" }}>{GHS(report.netProfit)}</div><div style={{ fontSize: 11, color: W.rose }}>{report.netProfit < 0 ? "Net loss" : "Net profit"}</div></div>
           <div><div style={{ fontSize: 17, fontWeight: 700 }}>{report.orders}</div><div style={{ fontSize: 11, color: W.rose }}>Orders</div></div>
           <div><div style={{ fontSize: 17, fontWeight: 700 }}>{report.units}</div><div style={{ fontSize: 11, color: W.rose }}>Units</div></div>
         </div>
@@ -1808,6 +1970,8 @@ function Reports({ db }) {
       {/* Metric grid */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 16 }}>
         <MetricBox label="Cost of Goods" value={GHS(report.cost)} accent={W.amber} />
+        <MetricBox label="Expenses" value={GHS(report.expensesTotal)} accent={W.red} />
+        <MetricBox label={report.netProfit < 0 ? "Net Loss" : "Net Profit"} value={GHS(report.netProfit)} accent={report.netProfit < 0 ? W.red : W.green} />
         <MetricBox label="Avg Order" value={GHS(report.avgOrder)} accent={W.accent} />
         <MetricBox label="Discounts" value={GHS(report.discount)} accent={W.red} />
         {report.refunds > 0 && <MetricBox label={`Refunds (${report.returnCount})`} value={GHS(report.refunds)} accent={W.red} />}
@@ -1815,9 +1979,37 @@ function Reports({ db }) {
 
       {/* Trend chart */}
       <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}`, marginBottom: 16 }}>
-        <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, marginBottom: 14 }}>Revenue Trend</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: W.wine }}>{metric === "revenue" ? "Revenue Trend" : metric === "profit" ? "Gross Profit Trend" : "Net Profit Trend"}</div>
+          <div style={{ display: "flex", gap: 4, background: W.blush, padding: 3, borderRadius: 9 }}>
+            {[["revenue", "Revenue"], ["profit", "Gross"], ...(period !== "daily" ? [["net", "Net"]] : [])].map(([id, label]) => (
+              <button key={id} onClick={() => setTrendMetric(id)} style={{ border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 11.5, fontWeight: 700, padding: "5px 11px", borderRadius: 7, background: metric === id ? W.wine : "transparent", color: metric === id ? "#fff" : W.muted }}>{label}</button>
+            ))}
+          </div>
+        </div>
         <BarChart data={trend} height={150} />
       </div>
+
+      {/* Expense breakdown */}
+      {report.expenseByCat.length > 0 && (
+        <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}`, marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: W.wine, marginBottom: 14 }}>Expenses by Category</div>
+          {report.expenseByCat.map(([cat, amt]) => {
+            const pct = report.expensesTotal ? (amt / report.expensesTotal) * 100 : 0;
+            return (
+              <div key={cat} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 5 }}>
+                  <span style={{ color: W.ink, fontWeight: 600 }}>{cat}</span>
+                  <span style={{ color: W.red, fontWeight: 700 }}>{GHS(amt)} · {pct.toFixed(0)}%</span>
+                </div>
+                <div style={{ height: 7, background: W.blush, borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ width: `${pct}%`, height: "100%", background: W.red, borderRadius: 4 }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* Top products */}
       <div style={{ background: "#fff", borderRadius: 16, padding: "18px 20px", border: `1px solid ${W.border}`, marginBottom: 16 }}>
@@ -2163,7 +2355,7 @@ function Settings({ db, setDb, showToast, onLogout, session }) {
               const fresh = seed(); setDb(fresh); setConfirmReset(false); showToast("Clearing cloud data…");
               try {
                 await clearCloud();
-                logAudit({ actor: session?.name, role: session?.role, action: "reset", entity: "data", entityId: "all", summary: "Reset all data (products, sales, clients, staff)" });
+                logAudit({ actor: session?.name, role: session?.role, action: "reset", entity: "data", entityId: "all", summary: "Reset all data (products, sales, clients, staff, expenses)" });
                 showToast("All data reset");
               } catch {
                 showToast("Local data reset — cloud clear failed, check connection", "err");
